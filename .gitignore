@@ -1,0 +1,27 @@
+# Local dependencies and Python build/cache files
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+build/
+dist/
+
+# Local settings and credentials
+.DS_Store
+.env
+.env.*
+!.env.example
+
+# Downloaded media and per-run state are never project source
+downloads/
+observations/
+manifest.json
+.manifest-*.tmp
+.download.lock
+*.mp4
+*.mkv
+*.ts
+*.m3u8
+*.log
