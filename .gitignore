@@ -7,12 +7,27 @@ __pycache__/
 *.egg-info/
 build/
 dist/
+node_modules/
+.venv-download/
 
 # Local settings and credentials
 .DS_Store
 .env
 .env.*
 !.env.example
+config.local.json
+.secrets/
+*.pem
+*.key
+
+# Persistent runtime and collection evidence stay local; never remove for packaging.
+.runtime/
+claims/
+*.dump
+*.bak
+*.zip
+*.tar
+*.tar.gz
 
 # Downloaded media and per-run state are never project source
 downloads/
@@ -25,3 +40,21 @@ manifest.json
 *.ts
 *.m3u8
 *.log
+
+# Public GitHub repository contains skills and their supporting tools only.
+/Datebase/
+/web/
+/deploy/
+/docs/
+/scripts/catalogue/
+*.db
+*.sqlite
+*.sqlite3
+*.sql
+*.sql.gz
+*.csv
+*.tsv
+*.ndjson
+*.jsonl
+*.pfx
+*.p12

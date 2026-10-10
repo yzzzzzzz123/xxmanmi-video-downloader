@@ -1,1 +1,4 @@
+psycopg[binary]==3.3.6
 imageio-ffmpeg==0.6.0
+Pillow==11.3.0; sys_platform == "win32"
+Pillow==12.3.0; sys_platform != "win32"

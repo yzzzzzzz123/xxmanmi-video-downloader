@@ -25,7 +25,6 @@ import unicodedata
 import urllib.parse
 import urllib.request
 
-DEFAULT_OUTPUT = Path('/Users/yuzhizheng/Desktop/codex/小小漫迷')
 MANIFEST = 'manifest.json'
 GIB = 1024 ** 3
 
@@ -482,7 +481,8 @@ def run(root, state, binary, floor, limit, retry_failed=False):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--output', type=Path, default=DEFAULT_OUTPUT)
+    parser.add_argument('--output', type=Path, required=True,
+                        help='Explicit task workspace outside the final video library')
     sub = parser.add_subparsers(dest='command', required=True)
     add = sub.add_parser('ingest', help='Read CUA observation JSON from stdin')
     add.add_argument('--new-scope', action='store_true')

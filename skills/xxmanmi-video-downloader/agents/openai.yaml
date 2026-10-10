@@ -1,0 +1,4 @@
+interface:
+  display_name: "小小漫迷 / 漫映项目"
+  short_description: "公开页面四路采集、资源库、漫映网站与下载的统一项目入口，按任务读取细则"
+  default_prompt: "使用 $xxmanmi-video-downloader 按本次授权处理小小漫迷项目，复用正式断点并读取对应采集、网站、下载或同步细则。"

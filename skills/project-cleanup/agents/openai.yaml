@@ -1,0 +1,4 @@
+interface:
+  display_name: "清理 Skill"
+  short_description: "以 CLI 清理停用采集线程、失效占用和废弃产物，保留有效数据与证据"
+  default_prompt: "使用 $project-cleanup 核实并清理本项目停用线程与废弃产物，先预检再执行。"
