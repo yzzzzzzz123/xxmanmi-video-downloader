@@ -19,7 +19,7 @@ description: 将漫映本地所有节目之外的项目变更发布到新加坡�
 ## 当前环境与保护边界
 
 - 仓库根目录为本 skill 的上两级。应用源码 web/，结构定义 Datebase/xxmanmi-resource-db/schema.sql 与 web-accounts.sql，部署资料 web/deploy/；以当前实际导入图、页面引用和变更确定完整发布包。
-- 当前生产为 Ubuntu ubuntu@example.invalid、数据库 manying、服务 manying.service；应用目录从实际服务配置和版本指针解析，运行数据 /var/lib/manying/runtime、配置 /etc/manying。连接与权限每次核实，通过已核验主机密钥的 SSH 操作；部署密钥从当前用户的 ~/.ssh/manying_deploy 解析。
+- 当前生产为 Ubuntu ubuntu@43.134.92.99、数据库 manying、服务 manying.service；应用目录从实际服务配置和版本指针解析，运行数据 /var/lib/manying/runtime、配置 /etc/manying。连接与权限每次核实，通过已核验主机密钥的 SSH 操作；部署密钥从当前用户的 ~/.ssh/manying_deploy_20260929 解析。
 - 真实账号、会员、会话、订单、支付、收藏、观看记录和活动数据始终以生产为准。代码或结构变更不得导入本地测试用户、重建这些表或丢失已有行；新表必须核对网站账号实际所需权限。
 - 发布配置时以生产文件为底合并项目要求的变更，保留生产密钥、域名、路径和环境值；不将本地 .env、.secrets、venv、数据库文件或 runtime 整体覆盖线上。
 - 备份后使用经验证的前向结构迁移和保留回退点的代码切换，不执行 install.sh/finish-install.sh 等初装重建流程。网页发布只重启必要的网页服务，不顺带重启采集数据库、采集线程、浏览器或终端。

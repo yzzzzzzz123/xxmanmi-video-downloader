@@ -1,0 +1,20 @@
+[Unit]
+Description=Private Manying publisher verification desktop (SSH only)
+
+[Service]
+Type=simple
+User=manying-publisher
+Group=manying-publisher
+Environment=HOME=/var/lib/manying-publisher
+ExecStart=/opt/manying-publisher/venv/bin/python /opt/manying-publisher/current/workspace/skills/manying-wechat-publisher/scripts/server_desktop.py
+Restart=on-failure
+RestartSec=5
+UMask=0077
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/manying-publisher /tmp
+InaccessiblePaths=/etc/manying /var/lib/manying /opt/manying
+MemoryMax=180M
+TasksMax=32
+

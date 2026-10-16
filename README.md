@@ -1,71 +1,81 @@
-# 小小漫迷 / 漫映 Agent Skills
+# 小小漫迷 / 漫映项目
 
-面向 Codex 等 Agent 的公开页面 DOM 采集、视频下载、断点恢复、受控清理、节目同步与公众号图文工作流。
+项目包含公开页面资源采集、PostgreSQL 原始资源库、漫映在线片库、视频下载和受控生产同步。采集从浏览器实际可见的 DOM 读取详情与媒体地址；下载器只处理已经观察到的未加密点播资源。
 
-本仓库开源 Skill、参考文档与配套工具，使用 [MIT License](LICENSE)。数据库整个目录、数据库结构与配置、采集记录、网站业务代码、账号数据、运行状态、媒体和本机凭据由使用者私有保存。
+唯一技能入口：[skills/xxmanmi-video-downloader/SKILL.md](skills/xxmanmi-video-downloader/SKILL.md)。阅读技能、整理项目和运行检查不会启动采集或发布生产。
 
-## Skill 入口
+## 目录与职责
 
-唯一主入口为 [skills/xxmanmi-video-downloader/SKILL.md](skills/xxmanmi-video-downloader/SKILL.md)，根目录不维护副本。
-
-| Skill | 用途 |
+| 目录 | 内容 |
 | --- | --- |
-| [xxmanmi-video-downloader](skills/xxmanmi-video-downloader/SKILL.md) | 按本次授权选择采集、下载与恢复流程 |
-| [project-cleanup](skills/project-cleanup/SKILL.md) | 核实归属后清理失效线程与专属资源 |
-| [manying-production-sync](skills/manying-production-sync/SKILL.md) | 节目管理数据与资源的受控同步工作流 |
-| [manying-project-deploy](skills/manying-project-deploy/SKILL.md) | 应用发布、结构迁移与回退工作流 |
-| [manying-wechat-publisher](skills/manying-wechat-publisher/SKILL.md) | 公众号选题、图文排版、查重、存档与浏览器发布 |
+| [skills/](skills/) | 主技能，以及清理、节目同步、应用发布、公众号发布技能 |
+| [references/](references/) | 按任务读取的采集、断点恢复、下载和同步细则 |
+| [scripts/collection/](scripts/collection/) | 共享认领、公开 DOM 采集辅助、恢复、正式收批与同步 CLI |
+| [scripts/catalogue/](scripts/catalogue/) | 已授权的历史系列退役工具及验证；不在启动时执行 |
+| [scripts/download.py](scripts/download.py) | 已观察媒体队列的 HLS 下载器，Linux/macOS/WSL 使用 |
+| [Datebase/xxmanmi-resource-db/](Datebase/xxmanmi-resource-db/README.md) | 数据库结构、Docker 配置与入库工具；沿用既有目录名 |
+| [web/](web/README.md) | 网站、账号、播放器、封面工具、静态资源和部署资料 |
+| [scripts/projectctl.py](scripts/projectctl.py) | 本地源码检查与完整源码包导出 |
 
-保留完整仓库目录，使 Skill 的相对路径能够找到 [references/](references/)、[scripts/](scripts/) 和 [AGENTS.md](AGENTS.md)。在 Agent 的项目上下文中读取主 Skill，再说明本次任务、范围和输出目录。加载 Skill 不启动采集、清理或生产发布。
+源码、技能和必要网页资产在本项目内；`.runtime/`、`claims/`、数据库卷、封面缓存、虚拟环境及秘密属于运行环境。整理源码不删除这些数据。迁机时须另行迁移数据库与必要断点，并在目标机配置凭据。
 
-## 下载与本地工具
+## 本地安装
 
-Python 3.11+。下载器运行于 Linux、macOS 或 Windows 的 WSL，需要 FFmpeg 与 ffprobe；可使用系统安装，或按下面的依赖清单安装 `imageio-ffmpeg`。
+Python 3.11+；数据库需要 Docker 与 Compose，封面和下载需要 FFmpeg。浏览器操作使用当前环境已授权的浏览器工具，不能将本项目当作独立 HTTP 爬虫。
 
-```bash
-git clone https://github.com/yzzzzzzz123/xxmanmi-video-downloader.git
-cd xxmanmi-video-downloader
-python3 -m venv .venv
-.venv/bin/python -m pip install -r requirements.txt
-```
-
-浏览器操作使用当前 Agent 环境已经授权的工具，只从实际打开的公开页面 DOM 读取资源。将真实观察保存为 [队列约定](references/queue-contract.md) 中的 JSON 后，显式指定片库之外的工作目录：
-
-```bash
-.venv/bin/python scripts/download.py --output ./downloads ingest < observed-batch.json
-.venv/bin/python scripts/download.py --output ./downloads run --limit 1
-.venv/bin/python scripts/download.py --output ./downloads status
-```
-
-下载器只处理已观察到的未加密点播 HLS，保存进度并校验时长与 SHA-256。站点发现、同标签导航和范围完成判断按 [CUA 工作流](references/cua-workflow.md) 与 [下载交付规则](references/download-and-delivery.md) 执行；当前队列完成只证明该队列的处理结果。
-
-公众号工具使用 Python 标准库，可在 Windows 运行：
+在项目根目录执行：
 
 ```powershell
-python -X utf8 skills/manying-wechat-publisher/scripts/publisherctl.py --help
-python -X utf8 skills/manying-wechat-publisher/scripts/archive_articles.py --help
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r scripts/collection/requirements.txt
+.\.venv\Scripts\python.exe -m pip install -r web/requirements.txt
+.\.venv\Scripts\python.exe Datebase/xxmanmi-resource-db/dbctl.py status
+.\.venv\Scripts\python.exe web/manage.py status
 ```
 
-## 私有环境依赖
+Linux/macOS 使用 `.venv/bin/python`。运行依赖只维护 [web/requirements.txt](web/requirements.txt)；Playwright collection uses [scripts/collection/requirements.txt](scripts/collection/requirements.txt) and installed Google Chrome，Windows 与 Linux 的 Pillow 版本按平台选择。数据库初装与导入见[数据库说明](Datebase/xxmanmi-resource-db/README.md)，不要在已有环境重建数据卷或重跑生产初装。
 
-采集入库、封面服务、节目同步和应用部署沿用项目环境合同，需要使用者自行提供私有 `Datebase/xxmanmi-resource-db/` 与 `web/` 模块、数据库、运行目录及授权连接。这些流程不能仅凭公开仓库直接完成。部分配套脚本会导入上述私有模块；它们作为集成参考提供，运行前须核对自己的环境。
+网站配置参考 [web/config.example.json](web/config.example.json)，复制为 `web/config.local.json` 后填写本机路径；该本机文件不提交、不打包。也可使用 `MANYING_RUNTIME`、`MANYING_DB_ROOT` 等环境变量。已有配置继续使用，不能以示例覆盖。
 
-公开版文档及脚本中的 `ubuntu@example.invalid` 和 `~/.ssh/manying_deploy` 是示例，必须在使用者私有副本中配置并核实实际目标。连接凭据留在本机安全配置中。节目数据同步与应用发布各自需要用户明确授权，并保留生产账号、会员、会话、收藏和观看数据。
+## 使用入口
 
-数据库目录、SQL、数据导出、采集证据、封面、公众号稿件、运行 manifest、视频与秘密由 `.gitignore` 排除。公开检查与打包只读取本仓库的 Skill 和工具，不连接数据库、不启动采集或服务。
+| 任务 | 入口 |
+| --- | --- |
+| 开始或继续采集 | 让 Agent 读取[主技能](skills/xxmanmi-video-downloader/SKILL.md)，按用户明确范围续原断点 |
+| 查询本地资源库 | `python Datebase/xxmanmi-resource-db/dbctl.py status` |
+| 查询网站状态 | `python web/manage.py status` |
+| 启动本地网站 | `python web/manage.py start`，后台隐藏启动；本机访问 `http://127.0.0.1:8088` |
+| 查询事件同步状态 | `python scripts/collection/production_live.py status` |
+| 下载已观察媒体 | 按[下载与交付](references/download-and-delivery.md)和[队列约定](references/queue-contract.md)执行；Windows 使用 WSL |
+| 同步节目数据 | [manying-production-sync](skills/manying-production-sync/SKILL.md)，保护生产用户数据 |
+| 发布网站代码 | [manying-project-deploy](skills/manying-project-deploy/SKILL.md)，需要本次明确生产授权 |
 
-## 检查与公开源码包
+Current execution: one agent directly owns isolated headless Playwright, resource audits, covers, ACK and verified catalogue sync. No collector subagents or CUA. See [the workflow](references/low-token-workflow.md).
+
+生产节目同步按提交事件处理，不等待 300 个节目。旧冻结轮工具只用于原历史包的恢复；数据同步与应用发布使用各自技能，查询状态和整理项目都不触发生产写入。
+
+## 检查与源码打包
+
+下列命令只读取源码，不连接数据库、不启动浏览器、采集者或网站，也不访问生产：
 
 ```powershell
-python -X utf8 -B scripts/projectctl.py check
-python -X utf8 -B scripts/projectctl.py package
-python -X utf8 -B -m unittest discover -s skills/manying-wechat-publisher/scripts -p 'test_*.py' -q
+python -B scripts/projectctl.py check
+python -B scripts/projectctl.py package
 ```
 
-默认包为 `dist/xxmanmi-video-downloader.zip`，包含公开 Skill、参考和工具，并附逐文件 SHA-256 清单。已有包不覆盖；可用 `--output` 指定新路径。下载器的本地隔离测试在 Linux/macOS/WSL 执行：
+默认生成 `dist/xxmanmi-video-downloader.zip`，包含项目源码、技能、参考、静态资源、依赖清单和部署资料，包内附逐文件 SHA-256 清单。排除凭据、本机配置、运行状态、认领记录、数据库导出、视频、缓存及开发环境；不会因 Git 中尚未跟踪而漏掉现有正式源码。已有同名包不覆盖，可用 `--output` 指定新路径。
 
-```bash
-python3 -B scripts/test_download.py
+现有验证入口：
+
+```powershell
+python -B -m unittest discover -s scripts/collection -p test_shared_discovery.py -q
+python -B -m unittest discover -s skills/project-cleanup/scripts -p test_cleanupctl.py -q
+python -B -m unittest discover -s web -p test_ai_search_fallback.py -q
+npm --prefix web ci --ignore-scripts
+npm --prefix web run test:ui
+node --test scripts/collection/test-capture-batch.mjs scripts/collection/test-capture-with-recovery.mjs scripts/collection/test-detail-capture.mjs scripts/collection/test-search-lifecycle.mjs
 ```
 
-只处理正常可访问且已获使用授权的资源，遵守来源站点与平台要求。
+Python 验证使用已安装项目依赖的环境。DOM 测试依赖 `jsdom`、`css-tree`，仅用于开发；数据库集成测试使用独立测试 schema，不能指向生产。下载器测试须在 Linux/macOS/WSL 运行。
+
+只处理公开、正常可访问的资源，不绕过登录、验证码、付费权限或 DRM。网页是否展示节目与管理库是否保留节目是两套口径：管理库保留真实原始记录，观看端只展示通过资源与封面门禁的节目。

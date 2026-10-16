@@ -25,8 +25,8 @@ from config import RUNTIME as WEB_RUNTIME, db_options  # noqa: E402
 STATE = PROJECT / "Datebase" / "xxmanmi-resource-db" / ".runtime" / "collection-coordination" / "state.json"
 RUNTIME = PROJECT / ".runtime" / "production-sync"
 LOCK = RUNTIME / "worker.lock"
-KEY = Path.home() / ".ssh" / "manying_deploy"
-HOST = "ubuntu@example.invalid"
+KEY = Path.home() / ".ssh" / "manying_deploy_20260929"
+HOST = "ubuntu@43.134.92.99"
 COVERS = WEB_RUNTIME / "thumbnails"
 BATCH_RE = re.compile(r"batch-[0-9]{6}")
 SHA_RE = re.compile(r"[0-9a-f]{64}")

@@ -415,3 +415,4 @@ test('actual diagnostic callback flags over-24000 visible text and blocks unseen
     assert.equal(observed.visibleTextTruncated, bodyText.length > 24000);
   }
 });
+

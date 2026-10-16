@@ -1,0 +1,38 @@
+[Unit]
+Description=Manying isolated WeChat publication batch
+Wants=network-online.target
+After=network-online.target manying-publisher-desktop.service
+Requires=manying-publisher-desktop.service
+
+[Service]
+Type=oneshot
+User=manying-publisher
+Group=manying-publisher
+WorkingDirectory=/var/lib/manying-publisher
+Environment=HOME=/var/lib/manying-publisher
+Environment=CODEX_HOME=/var/lib/manying-publisher/.codex
+Environment=PATH=/opt/manying-publisher/venv/bin:/opt/manying-publisher/bin:/usr/local/bin:/usr/bin:/bin
+Environment=DISPLAY=:97
+Environment=XAUTHORITY=/var/lib/manying-publisher/.Xauthority
+Environment=MANYING_RPA_PROFILE=/var/lib/manying-publisher/rpa-profile
+Environment=MANYING_RPA_CHANNEL=chromium
+Environment=MANYING_RPA_HEADED=1
+Environment=MANYING_RPA_PROXY=http://127.0.0.1:17897
+Environment=PLAYWRIGHT_BROWSERS_PATH=/opt/manying-publisher/browsers
+ExecStart=/opt/manying-publisher/venv/bin/python /opt/manying-publisher/current/workspace/skills/manying-wechat-publisher/scripts/server_runner.py --config /etc/manying-publisher/publisher.json run-due
+TimeoutStartSec=115min
+TimeoutStopSec=30
+KillMode=control-group
+UMask=0077
+Nice=10
+CPUQuota=120%
+MemoryHigh=900M
+MemoryMax=1250M
+MemorySwapMax=768M
+TasksMax=256
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/manying-publisher /tmp
+InaccessiblePaths=/etc/manying /var/lib/manying /opt/manying
+

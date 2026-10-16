@@ -165,3 +165,4 @@ export async function captureDetailWithRecovery(tab, item, workDirectory, {
   });
   return result;
 }
+

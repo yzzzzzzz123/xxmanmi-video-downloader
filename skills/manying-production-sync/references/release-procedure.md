@@ -36,6 +36,6 @@
 
 ## 连接与联合发布
 
-当前远端为 ubuntu@example.invalid，数据库 manying。优先通过服务器本地 sudo -n -u postgres psql/pg_dump 或 SSH 隧道的最小权限账号操作；远端凭据只在受控进程内读取，不写入命令行历史或同步包。
+当前远端为 ubuntu@43.134.92.99，数据库 manying。优先通过服务器本地 sudo -n -u postgres psql/pg_dump 或 SSH 隧道的最小权限账号操作；远端凭据只在受控进程内读取，不写入命令行历史或同步包。
 
 同时执行两项 Skill 时，按 [项目发布操作细则](../../manying-project-deploy/references/release-procedure.md) 统一冻结本地变更、规划兼容顺序和备份；节目部分仍只写本文件规定的数据。任一部分失败，应分别报告已完成与未完成项，不能把另一部分成功当成完整发布。

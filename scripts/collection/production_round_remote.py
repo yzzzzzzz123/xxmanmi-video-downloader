@@ -199,6 +199,24 @@ ROLLBACK;
     psql(preamble + check)
 
 
+def service_runtime():
+    """Read the existing service's interpreter and application, without restarting it."""
+    pid = run(['systemctl', 'show', 'manying.service', '-p', 'MainPID', '--value']).decode().strip()
+    require(pid.isdecimal() and int(pid) > 0, 'No active application process')
+    process = Path('/proc') / pid
+    interpreter = process.joinpath('cmdline').read_bytes().split(b'\0', 1)[0].decode()
+    require(re.fullmatch(r'/opt/manying/(?:releases/project-[A-Za-z0-9_-]+/)?'
+                         r'venv/bin/python(?:[0-9.]+)?', interpreter) is not None
+            and Path(interpreter).is_file(), 'Unverified application interpreter')
+    application = process.joinpath('cwd').resolve()
+    require(application == (BASE / 'app').resolve() and application.is_relative_to(BASE)
+            and (application / 'server.py').is_file(), 'Service/application pointer differs')
+    # starttime identifies this process even if its PID is reused.
+    starttime = process.joinpath('stat').read_text().rsplit(')', 1)[1].split()[19]
+    return {'pid': pid, 'starttime': starttime, 'interpreter': interpreter,
+            'application_directory': str(application)}
+
+
 def acceptance(ids):
     # Run the existing application route functions with its current service environment,
     # and separately verify live HTTP health and authentication enforcement. No user session
@@ -210,10 +228,10 @@ pid=int(sys.argv[1]); values=Path(f'/proc/{pid}/environ').read_bytes().split(b'\
 for value in values:
  if b'=' in value:
   k,v=value.split(b'=',1); os.environ[k.decode()]=v.decode()
-sys.path.insert(0,'/opt/manying/app')
+sys.path.insert(0,sys.argv[3])
 import server
 from starlette.requests import Request
-ids=json.loads(sys.argv[2]); checked=[]; media_ids=[]
+ids=json.loads(sys.argv[2]); checked=[]; media_ids=[]; delivery_modes=set()
 request=Request({'type':'http','method':'HEAD','scheme':'https','path':'/media/0',
  'headers':[(b'host',b'manying.example')], 'client':('127.0.0.1',1),
  'server':('127.0.0.1',8088),'query_string':b''})
@@ -227,19 +245,36 @@ for i in ids:
  row=server.program(i)
  assert row['id']==i and row['episodes']
  sources=[s for e in row['episodes'] for s in e['sources']]
- assert sources and all(s['url']==f"/media/{s['id']}" for s in sources)
- response=asyncio.run(server.media(request,sources[0]['id']))
- assert response.status_code==307 and response.headers['location'].startswith('https://')
+ assert sources and all(type(s['id']) is int and s['id']>0 for s in sources)
+ if all('url' not in s and s.get('href')==f"/out/{s['id']}" for s in sources):
+  # Current resource-search application intentionally retires in-site playback.
+  # Exercise its real stored-resource route; do not follow the external redirect.
+  response=server.open_external_resource(request,sources[0]['id'])
+  assert response.status_code==302
+  delivery_modes.add('external_resources')
+ else:
+  assert all(s.get('url')==f"/media/{s['id']}" for s in sources)
+  response=asyncio.run(server.media(request,sources[0]['id']))
+  assert response.status_code==307
+  delivery_modes.add('playback')
+ assert response.headers['location'].startswith('https://')
  checked.append(i)
  media_ids.append(sources[0]['id'])
 server.library.close()
-print(json.dumps({'route_programmes':checked,'playback_redirects':len(checked),'listed_programmes':len(listed),'media_resource_ids':media_ids}))
+assert len(delivery_modes)==1
+mode=delivery_modes.pop()
+print(json.dumps({'route_programmes':checked,'delivery_mode':mode,
+ 'playback_redirects':len(checked) if mode=='playback' else 0,
+ 'external_resource_redirects':len(checked) if mode=='external_resources' else 0,
+ 'listed_programmes':len(listed),'media_resource_ids':media_ids}))
 '''
-    pid = run(['systemctl', 'show', 'manying.service', '-p', 'MainPID', '--value']).decode().strip()
-    result = json.loads(run(['/opt/manying/venv/bin/python', '-B', '-c', probe, pid,
-                             json.dumps(ids)], timeout=240))
-    require(result['route_programmes'] == ids and result['playback_redirects'] == len(ids),
-            'Programme/playback route verification incomplete')
+    runtime = service_runtime()
+    result = json.loads(run([runtime['interpreter'], '-B', '-c', probe, runtime['pid'],
+                             json.dumps(ids), runtime['application_directory']], timeout=240))
+    require(result['route_programmes'] == ids
+            and result['delivery_mode'] in ('playback', 'external_resources')
+            and result['playback_redirects'] + result['external_resource_redirects'] == len(ids),
+            'Programme/resource delivery route verification incomplete')
     with urlopen('http://127.0.0.1:8088/api/health', timeout=15) as response:
         require(json.load(response).get('ok') is True, 'Live health API failed')
     # The current website intentionally exposes title cards to anonymous visitors.
@@ -254,14 +289,25 @@ print(json.dumps({'route_programmes':checked,'playback_redirects':len(checked),'
         require(response.status == 200 and isinstance(catalogue.get('items'), list)
                 and type(catalogue.get('total')) is int and catalogue['total'] >= 0,
                 'Live public catalogue check failed')
-    for route in (f'/api/programs/{ids[0]}', f'/media/{result["media_resource_ids"][0]}'):
+    delivery_prefix = 'out' if result['delivery_mode'] == 'external_resources' else 'media'
+    for route in (f'/api/programs/{ids[0]}', f'/{delivery_prefix}/{result["media_resource_ids"][0]}'):
         try:
             with opener.open('http://127.0.0.1:8088' + route, timeout=15):
                 raise ValueError('Unauthenticated protected request was accepted')
         except HTTPError as exc:
             require(exc.code in (401, 403), 'Live authentication check failed')
+    if result['delivery_mode'] == 'external_resources':
+        try:
+            with opener.open('http://127.0.0.1:8088/media/'
+                             + str(result['media_resource_ids'][0]), timeout=15):
+                raise ValueError('Retired playback route was accepted')
+        except HTTPError as exc:
+            require(exc.code == 410, 'Retired playback route changed')
+        result['retired_playback_enforced'] = True
     result['live_authentication_enforced'] = True
     result['live_public_catalogue_available'] = True
+    require(service_runtime() == runtime, 'Application runtime changed during acceptance')
+    result['service_runtime'] = runtime
     return result
 
 
@@ -354,7 +400,7 @@ END $source_scope$;
         receipt = {'ok': True, 'verified': True, 'release_id': manifest['release_id'],
                    'bundle_sha256': bundle_hash, 'identity_manifest_sha256': identity_hash,
                    'package_manifest_sha256': manifest_hash, 'resource_rows': manifest['resource_rows'],
-                   'target': 'ubuntu@example.invalid', 'database': 'manying', 'checks': checks,
+                   'target': 'ubuntu@43.134.92.99', 'database': 'manying', 'checks': checks,
                    'database_backup': str(db_backup), 'application_backup': str(app_backup),
                    'application_directory': str((BASE / 'app').resolve()),
                    'application_backup_sha256': digest(app_backup.read_bytes()),

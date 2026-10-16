@@ -1,9 +1,10 @@
-"""Fixed recovery routing and a durable one-hour all-project stop budget."""
+"""Fixed recovery routing and a durable two-hour all-project stop budget."""
 import argparse
 import hashlib
 import json
 import os
 import re
+import subprocess
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -19,6 +20,7 @@ utc_now = coordctl.utc_now
 MAIN = PROJECT / '.runtime/main-agent/state.json'
 POLICY = PROJECT / '.runtime/main-agent/automation-policy.json'
 RECOVERY = PROJECT / '.runtime/main-agent/recovery-current.json'
+RECOVERY_BUDGET_SECONDS = 7200
 
 # Templates select existing gates. They never invent evidence or replay actions.
 TEMPLATES = [
@@ -63,7 +65,8 @@ def mutate(operation):
 def slot_for(owner):
     main = json.loads(MAIN.read_text('utf-8'))
     matches = [(slot, entry) for slot, entry in main.get('slots', {}).items()
-               if entry.get('owner') == owner and slot in ('01', '02', '03', '04')]
+               if entry.get('owner') == owner and slot in (
+                   ('main',) if main.get('execution_mode') == 'single' else ('01', '02', '03', '04'))]
     if len(matches) != 1:
         raise ValueError('Recovery owner must be one current, real collection slot')
     return matches[0]
@@ -85,6 +88,10 @@ def record(owner, error, *, command=None, batch=None, tool_id=None):
     route = classify(error)
     if not route['incident']:
         return {'ok': True, **route}
+    replay = _acknowledged_native_report(owner, binding, batch, tool_id)
+    if replay:
+        return {'ok': True, 'status': 'ignored_acknowledged_native_report',
+                'slot': slot, 'proof': replay}
     def note(current):
         if current['stopped']:
             return {'ok': False, 'status': 'stopped'}
@@ -92,7 +99,7 @@ def record(owner, error, *, command=None, batch=None, tool_id=None):
         if not incident or incident.get('resolved_at'):
             at = datetime.now(timezone.utc)
             incident = {'slot': slot, 'owner': owner, 'first_failed_at': at.isoformat(),
-                        'deadline': (at + timedelta(seconds=3600)).isoformat(),
+                        'deadline': (at + timedelta(seconds=RECOVERY_BUDGET_SECONDS)).isoformat(),
                         'work': binding['work'], 'attempts': 0}
             current['incidents'][slot] = incident
         # New attempts, new native turns or replacement UUIDs do not reset time.
@@ -100,8 +107,20 @@ def record(owner, error, *, command=None, batch=None, tool_id=None):
         gesture_sha = hashlib.sha256(gesture_error.encode()).hexdigest()
         if error == gesture_error or incident.get('error_sha256') == gesture_sha:
             incident['gesture_outcome'] = 'unknown'
+        error_sha = hashlib.sha256(error.encode()).hexdigest()
+        if (incident.get('tool_id') and (incident['tool_id'] != tool_id
+                or incident.get('error_sha256') != error_sha)):
+            # A later connection diagnostic must not erase the failed action
+            # whose browser effect is still unknown. Keep its native pointer
+            # and original budget; this history never authorizes replay.
+            prior = {key: incident.get(key) for key in (
+                'tool_id', 'template', 'error_sha256', 'last_seen_at',
+                'command', 'batch', 'gesture_outcome')}
+            history = incident.setdefault('native_failure_history', [])
+            if not history or history[-1] != prior:
+                history.append(prior)
         incident.update(last_seen_at=utc_now(), template=route['template'],
-                        error_sha256=hashlib.sha256(error.encode()).hexdigest(),
+                        error_sha256=error_sha,
                         command=command, batch=batch, tool_id=tool_id)
         incident['attempts'] += 1
         return {'ok': True, **route, 'slot': slot, 'deadline': incident['deadline'],
@@ -255,7 +274,11 @@ def _native_budget_receipts(owner, binding, source_tool, *, batch_id=None):
                 row = json.loads(line)
             except (ValueError, UnicodeDecodeError):
                 continue
+            if row.get('type') != 'event_msg':
+                continue
             payload = row.get('payload', {})
+            if not isinstance(payload, dict):
+                raise ValueError('Malformed canonical native event')
             if (row.get('type') == 'event_msg' and payload.get('type') == 'item_completed'
                     and payload.get('item', {}).get('id') == source_tool):
                 found.append((row, offset, hashlib.sha256(line).hexdigest()))
@@ -267,6 +290,122 @@ def _native_budget_receipts(owner, binding, source_tool, *, batch_id=None):
     if len(found) != 1:
         raise ValueError('Exact terminal tool must be present once in bounded native receipts')
     return path, found[0], claims
+
+
+def _acknowledged_native_report(owner, binding, batch, tool_id):
+    """Prove an exact read-only capture call already followed by its own ACK.
+
+    Late delivery cannot open a new fault budget for that completed batch.
+    Missing provenance never suppresses a genuine current failure.
+    """
+    if not batch or not tool_id:
+        return None
+    row = coordctl._read_state(STATE).get('batches', {}).get(batch)
+    if (not row or row.get('thread') != owner or row.get('state') != 'acknowledged'
+            or row.get('acknowledged_by') != owner
+            or (row.get('verification') or {}).get('verified') is not True
+            or row.get('complete_captured') is not True
+            or (row.get('verification') or {}).get('cover_pending_items')):
+        return None
+    try:
+        from types import SimpleNamespace
+        from native_detailctl import code_for, generated_code_match
+        path, (event, offset, digest), _ = _native_budget_receipts(owner, binding, tool_id)
+        p = event['payload']; call = p['item']; result = call.get('result') or {}
+        surface = (result.get('_meta') or {}).get('codex/toolSurface') or {}
+        content = result.get('content', [])
+        if (p.get('thread_id') != owner or call.get('type') != 'McpToolCall'
+                or call.get('server') != 'cua_repl' or call.get('tool') != 'js'
+                or call.get('status') != 'completed' or call.get('error') or result.get('isError')
+                or surface.get('backend') != 'chrome' or surface.get('browserFamily') != 'chrome'
+                or len(content) != 1 or content[0].get('type') != 'text'):
+            return None
+        data = json.loads(content[0]['text'])
+        if (not isinstance(data, dict) or data.get('schema') != 'xxmanmi-native-detail-v1'
+                or data.get('owner') != owner or data.get('batch') != batch
+                or data.get('expectedUrl') not in row.get('item_urls', [])):
+            return None
+        completed = datetime.fromisoformat(event['timestamp'].replace('Z', '+00:00'))
+        acknowledged = datetime.fromisoformat(row['acknowledged_at'].replace('Z', '+00:00'))
+        if completed.tzinfo is None or not completed <= acknowledged:
+            return None
+        code = (call.get('arguments') or {}).get('code', '')
+        variable = re.match(r'if \(String\(([A-Za-z_$][\w$]*)\.id\)', code)
+        if not variable:
+            return None
+        for form in ('function', 'string', 'compact', 'compact-v2'):
+            args = SimpleNamespace(thread=owner, batch=batch, url=data['expectedUrl'],
+                                   tab_variable=variable[1], tab_id=data['tabId'],
+                                   segment_size=data.get('segmentSize', 1000), code_format=form)
+            expected = code_for(args, data.get('start'))
+            approved = generated_code_match(args, expected, code) is not None
+            # This exact previously rejected rendering is only a fault-history
+            # proof. It never becomes an accepted capture receipt or import.
+            rejected_spacing = (expected.count('JSON.stringify({...{') == 1
+                                and code == expected.replace('JSON.stringify({...{',
+                                                            'JSON.stringify({ ...{', 1))
+            if approved or rejected_spacing:
+                return {'kind': 'acknowledged_native_report', 'batch': batch, 'tool_id': tool_id,
+                        'native_completed_at': completed.isoformat(), 'acknowledged_at': acknowledged.isoformat(),
+                        'canonical_session': str(path), 'byte_offset': offset,
+                        'record_sha256': digest, 'code_sha256': hashlib.sha256(code.encode()).hexdigest(),
+                        'source_code_status': 'approved_rendering' if approved else 'rejected_capture_spacing'}
+    except (OSError, ValueError, KeyError, TypeError, RuntimeError, subprocess.TimeoutExpired):
+        return None
+    return None
+
+
+def _native_cua_fetch_budget_start(owner, binding, incident, source_tool, cycle_started_at):
+    """Pin a single read-only getState fetch fault to its real native completion."""
+    error = 'nodeRepl.fetch request failed'
+    if (incident.get('template') != 'unknown' or incident.get('resolved_at')
+            or incident.get('attempts') != 1 or source_tool != incident.get('tool_id')
+            or incident.get('batch') or incident.get('command')
+            or incident.get('error_sha256') != hashlib.sha256(error.encode()).hexdigest()):
+        raise ValueError('Fetch correction requires the single exact unresolved CUA failure')
+    path, (row, offset, digest), _ = _native_budget_receipts(owner, binding, source_tool)
+    payload = row['payload']; item = payload['item']; result = item.get('result') or {}
+    surface = (result.get('_meta') or {}).get('codex/toolSurface') or {}
+    if (payload.get('thread_id') != owner or not payload.get('turn_id')
+            or item.get('type') != 'McpToolCall' or item.get('status') != 'completed'
+            or item.get('server') != 'cua_repl' or item.get('tool') != 'js'
+            or (item.get('arguments') or {}).get('code') != 'await cua.getState();'
+            or surface.get('backend') != 'chrome' or surface.get('browserFamily') != 'chrome'
+            or not surface.get('browserId')):
+        raise ValueError('Native receipt does not prove the exact read-only CUA getState')
+    states = []
+    for part in result.get('content', []):
+        if part.get('type') != 'text':
+            continue
+        try:
+            value = json.loads(part.get('text', ''))
+        except (ValueError, TypeError):
+            continue
+        if isinstance(value, dict) and 'browsers' in value and 'errors' in value:
+            states.append(value)
+    if len(states) != 1:
+        raise ValueError('Native getState must contain one failed browser inventory')
+    inventory = states[0]; browsers = inventory.get('browsers')
+    if (not isinstance(browsers, list) or len(browsers) != 1
+            or browsers[0].get('family') != 'chrome'
+            or browsers[0].get('id') != surface['browserId'] or browsers[0].get('tabs') != []
+            or inventory.get('errors') != [f"Browser {surface['browserId']}: Error: {error}"]):
+        raise ValueError('Native inventory does not contain the exact Chrome fetch failure')
+    begin, end = payload.get('started_at_ms'), payload.get('completed_at_ms')
+    if type(begin) is not int or type(end) is not int or not 0 < begin <= end:
+        raise ValueError('Native fetch failure lacks completion timestamps')
+    at = datetime(1970, 1, 1, tzinfo=timezone.utc) + timedelta(milliseconds=end)
+    logged = datetime.fromisoformat(row['timestamp'].replace('Z', '+00:00'))
+    cycle = datetime.fromisoformat(cycle_started_at.replace('Z', '+00:00'))
+    last_seen = datetime.fromisoformat(incident['last_seen_at'].replace('Z', '+00:00'))
+    if (logged.tzinfo is None or not timedelta(0) <= logged - at <= timedelta(seconds=5)
+            or not cycle <= at <= last_seen <= datetime.now(timezone.utc) + timedelta(seconds=5)):
+        raise ValueError('Native fetch completion is outside this unresolved cycle')
+    record = {'tool_id': source_tool, 'turn_id': payload['turn_id'], 'status': item['status'],
+              'completed_at': at.isoformat(), 'byte_offset': offset, 'record_sha256': digest}
+    return at, {'canonical_session': str(path), 'native_records': [record],
+                'proof_kind': 'native_cua_getstate_fetch_failure',
+                'recorded_error_sha256': incident['error_sha256']}
 
 
 def _native_inventory_budget_start(owner, binding, incident, source_tool, cycle_started_at):
@@ -407,6 +546,49 @@ def _native_cdp_deadline_budget_start(owner, binding, incident, source_tool, cyc
     return times[0], {'proof_kind': 'native_cdp_deadline_chain', 'canonical_session': str(path),
                 'native_records': proofs, 'recorded_error_sha256': error_sha,
                 'gesture_outcome': 'unknown', 'replay_authorized': False}
+
+
+def _native_exec_setup_budget_start(owner, binding, incident, source_tool, cycle_started_at):
+    """Retain the real time of a proven process-creation failure, never replay it."""
+    expected = 'Failed to create unified exec process: helper_unknown_error: setup refresh had errors'
+    error_sha = hashlib.sha256(expected.encode()).hexdigest()
+    if (incident.get('template') != 'unknown' or incident.get('resolved_at')
+            or type(incident.get('attempts')) is not int or incident['attempts'] != 1
+            or not source_tool or source_tool != incident.get('tool_id')
+            or incident.get('batch') or incident.get('command')
+            or incident.get('error_sha256') != error_sha):
+        raise ValueError('Setup budget correction requires the single exact original failure')
+    path, (row, offset, digest), _ = _native_budget_receipts(owner, binding, source_tool)
+    payload = row['payload']; item = payload['item']; command = item.get('command')
+    if (payload.get('thread_id') != owner or not payload.get('turn_id')
+            or item.get('type') != 'CommandExecution' or item.get('source') != 'unified_exec_startup'
+            or item.get('status') != 'failed' or type(item.get('exit_code')) is not int
+            or item['exit_code'] != -1 or item.get('duration') != {'secs': 0, 'nanos': 0}
+            or item.get('aggregated_output') != expected
+            or item.get('cwd') not in (PROJECT.as_uri(), PROJECT.parent.as_uri())
+            or not isinstance(command, list) or len(command) not in (3, 4)
+            or not all(isinstance(part, str) and part for part in command)
+            or Path(command[0]).resolve() != (Path(os.environ.get('SystemRoot', 'C:/Windows'))
+                                             / 'System32/WindowsPowerShell/v1.0/powershell.exe').resolve()
+            or command[1:-1] not in (['-Command'], ['-NoProfile', '-Command'])):
+        raise ValueError('Native receipt does not prove the exact pre-launch setup failure')
+    begin, end = payload.get('started_at_ms'), payload.get('completed_at_ms')
+    if (type(begin) is not int or type(end) is not int or begin <= 0
+            or end - begin not in (0, 1)):
+        raise ValueError('Native setup failure lacks the observed pre-launch completion timestamps')
+    at = datetime(1970, 1, 1, tzinfo=timezone.utc) + timedelta(milliseconds=end)
+    logged = datetime.fromisoformat(row['timestamp'].replace('Z', '+00:00'))
+    cycle = datetime.fromisoformat(cycle_started_at.replace('Z', '+00:00'))
+    last_seen = datetime.fromisoformat(incident['last_seen_at'].replace('Z', '+00:00'))
+    if (logged.tzinfo is None or not timedelta(0) <= logged - at <= timedelta(seconds=5)
+            or not cycle <= at <= last_seen <= datetime.now(timezone.utc) + timedelta(seconds=5)):
+        raise ValueError('Native setup failure timestamps do not prove the current fault cycle')
+    proof = {'tool_id': source_tool, 'turn_id': payload['turn_id'], 'status': item['status'],
+             'completed_at': at.isoformat(), 'byte_offset': offset, 'record_sha256': digest,
+             'native_error_sha256': error_sha}
+    return at, {'canonical_session': str(path), 'earlier_failure': proof, 'current_failure': proof,
+                'proof_kind': 'native_exec_setup_failure', 'native_error_sha256': error_sha,
+                'recorded_error_sha256': incident['error_sha256']}
 
 
 def _native_lookup_budget_start(owner, binding, incident, source_tool, cycle_started_at):
@@ -650,12 +832,17 @@ def tighten_budget(owner, source_tool, *, authorized=False):
         scroll_error = 'Timed out after 10000ms waiting for CDP command Input.synthesizeScrollGesture.'
         if incident.get('error_sha256') == hashlib.sha256(scroll_error.encode()).hexdigest():
             prove_start = _native_cdp_deadline_budget_start
+        elif incident.get('error_sha256') == hashlib.sha256(b'nodeRepl.fetch request failed').hexdigest():
+            prove_start = _native_cua_fetch_budget_start
+        elif incident.get('error_sha256') == hashlib.sha256(
+                b'Failed to create unified exec process: helper_unknown_error: setup refresh had errors').hexdigest():
+            prove_start = _native_exec_setup_budget_start
         else:
             prove_start = (_native_unawaited_capture_budget_start if incident.get('batch')
                            else _native_lookup_budget_start)
     earlier, proof = prove_start(owner, binding, incident, source_tool, snapshot['cycle_started_at'])
     first = datetime.fromisoformat(incident['first_failed_at'])
-    deadline = earlier + timedelta(seconds=3600)
+    deadline = earlier + timedelta(seconds=RECOVERY_BUDGET_SECONDS)
     if earlier >= first:
         raise ValueError('Native receipt must strictly precede the existing first failure time')
     if deadline >= datetime.fromisoformat(incident['deadline']):
@@ -802,10 +989,28 @@ def progress(owner, *, batch=None, search_receipt=None, browser_source_tool=None
     if batch:
         coordination = coordctl._read_state(STATE)
         row = coordination.get('batches', {}).get(batch)
-        if (row and row['thread'] == owner and row['state'] == 'acknowledged'
+        handed_off = (coordination.get('execution_mode')=='single'
+            and coordination.get('collection_active_owner')==owner
+            and row and row.get('acknowledged_by')==owner
+            and any(v.get('batch')==batch and v.get('owner')==row.get('thread')
+                    for v in coordination.get('single_agent_migration',{}).get('ready_handoffs',[])))
+        if (row and (row['thread'] == owner or handed_off) and row['state'] == 'acknowledged'
                 and datetime.fromisoformat(row['acknowledged_at'].replace('Z', '+00:00')) >= since
                 and row.get('verification', {}).get('verified') is True):
-            proof = {'kind': 'formal_ack', 'batch': batch, 'at': row['acknowledged_at']}
+            pending = row.get('verification', {}).get('cover_pending_items', [])
+            cover_only = (incident.get('template') == 'central_cover_gate'
+                          and all(entry.get('template') == 'central_cover_gate'
+                                  for entry in incident.get('native_failure_history', [])))
+            if not pending or cover_only:
+                proof = {'kind': 'formal_cover_pending_settlement' if pending else 'formal_ack',
+                         'batch': batch, 'at': row['acknowledged_at'],
+                         'counts_as_programme_success': not bool(pending)}
+        elif (incident.get('batch') == batch and incident.get('template') == 'unknown'
+              and not incident.get('command') and not incident.get('native_failure_history')):
+            replay = _acknowledged_native_report(owner, binding, batch, incident.get('tool_id'))
+            if (replay and datetime.fromisoformat(replay['acknowledged_at']) < since):
+                proof = {**replay, 'kind': 'late_native_report_after_verified_ack',
+                         'counts_as_programme_success': False}
     elif browser_source_tool:
         proof = _browser_idle_progress(owner, binding, incident, browser_source_tool)
     elif search_receipt:
@@ -822,6 +1027,9 @@ def progress(owner, *, batch=None, search_receipt=None, browser_source_tool=None
     def resolved(saved):
         active = saved['incidents'].get(slot)
         if (active and not saved['stopped'] and active['first_failed_at'] == incident['first_failed_at']
+                and (proof.get('kind') != 'late_native_report_after_verified_ack' or
+                     all(active.get(key) == incident.get(key) for key in
+                         ('tool_id', 'batch', 'last_seen_at', 'error_sha256', 'native_failure_history')))
                 and (not browser_source_tool or
                      (active.get('tool_id') == incident.get('tool_id')
                       and active.get('last_seen_at') == incident.get('last_seen_at')))):
@@ -836,24 +1044,86 @@ def check():
     if config.get('enabled') is not True:
         return {'ok': True, 'enabled': False, 'stop_required': False}
     current = state()
+    cover_stop = coordctl._read_state(STATE).get('cover_outcomes', {}).get('stop_required')
     now = datetime.now(timezone.utc)
     incidents = []
     for slot, row in current['incidents'].items():
         if not row.get('resolved_at'):
             age = max(0, int((now - datetime.fromisoformat(row['first_failed_at'])).total_seconds()))
             incidents.append({'slot': slot, 'owner': row['owner'], 'template': row['template'],
-                              'age_seconds': age, 'deadline': row['deadline'], 'expired': age > 3600})
+                              'age_seconds': age,
+                              'deadline': (datetime.fromisoformat(row['first_failed_at'])
+                                           + timedelta(seconds=RECOVERY_BUDGET_SECONDS)).isoformat(),
+                              'expired': age > RECOVERY_BUDGET_SECONDS})
     return {'ok': True, 'stopped': current['stopped'], 'cycle_started_at': current['cycle_started_at'],
-            'incidents': incidents, 'stop_required': current['stopped'] or any(v['expired'] for v in incidents),
+            'incidents': incidents, 'cover_stop': cover_stop,
+            'stop_required': current['stopped'] or bool(cover_stop) or any(v['expired'] for v in incidents),
             'reporting': 'stop_cycle_only'}
 
 
-def stop_project(*, caller_thread=None):
-    if not check().get('stop_required'):
+def _direct_user_request(caller_thread, request_id, authorized, recorded=None, *, require_main=True):
+    """Verify an exact user item in the actual business main's current turn."""
+    if (not authorized or not isinstance(request_id, str) or not request_id.strip()
+            or not caller_thread or caller_thread != os.environ.get('CODEX_THREAD_ID')
+            or (require_main and (caller_thread != policy().get('main_thread')
+                or caller_thread != json.loads(MAIN.read_text('utf-8')).get('main_thread')))):
+        raise ValueError('Direct user control requires the actual main and an explicit request')
+    from app_server_control import RPC
+    with RPC() as rpc:
+        thread = rpc.call('thread/read', {'threadId': caller_thread, 'includeTurns': False})['thread']
+        if recorded:
+            if (recorded.get('request_id') != request_id or recorded.get('owner') != caller_thread
+                    or recorded.get('authorization') != 'direct_user' or not recorded.get('turn_id')):
+                raise ValueError('Stored request does not belong to this exact user operation')
+            cursor, items = None, []
+            for _ in range(8):
+                args = {'threadId': caller_thread, 'turnId': recorded['turn_id'],
+                        'limit': 128, 'sortDirection': 'asc'}
+                if cursor:
+                    args['cursor'] = cursor
+                page = rpc.call('thread/items/list', args)
+                items = [entry['item'] for entry in page.get('data', [])
+                         if entry.get('turnId') == recorded['turn_id']
+                         and entry.get('item', {}).get('id') == request_id
+                         and entry['item'].get('type') == 'userMessage']
+                cursor = page.get('nextCursor')
+                if items or not cursor:
+                    break
+            digest = (hashlib.sha256(json.dumps(items[0].get('content', []),
+                sort_keys=True, ensure_ascii=False).encode('utf-8')).hexdigest() if len(items) == 1 else None)
+            if (thread.get('id') != caller_thread or Path(thread['cwd']).resolve() not in
+                    {PROJECT.resolve(), PROJECT.parent.resolve()} or digest != recorded.get('content_sha256')
+                    or digest is None):
+                raise ValueError('Stored request cannot be reverified in its original native turn')
+            return {**recorded, 'reverified_at': utc_now()}
+        turns = rpc.call('thread/turns/list', {'threadId': caller_thread, 'limit': 1,
+            'sortDirection': 'desc', 'itemsView': 'full'}).get('data', [])
+    turn = turns[0] if turns else {}
+    items = [item for item in turn.get('items', [])
+             if item.get('id') == request_id and item.get('type') == 'userMessage']
+    if (thread.get('id') != caller_thread
+            or Path(thread['cwd']).resolve() not in {PROJECT.resolve(), PROJECT.parent.resolve()}
+            or len(items) != 1):
+        raise ValueError('Request is not a user message in the current native main turn')
+    return {'request_id': request_id, 'owner': caller_thread, 'turn_id': turn['id'],
+            'turn_status': turn.get('status'),
+            'authorization': 'direct_user', 'verified_at': utc_now(),
+            'content_sha256': hashlib.sha256(json.dumps(items[0].get('content', []),
+                sort_keys=True, ensure_ascii=False).encode('utf-8')).hexdigest()}
+
+
+def stop_project(*, caller_thread=None, request_id=None, authorized=False):
+    if request_id is None and not check().get('stop_required'):
         return {'ok': True, 'status': 'no_expired_incident', 'stopped': False}
     # Separate from the short ledger lock: only one driver issues stop RPCs.
     with coordctl.StateLock(RECOVERY.with_name('stop-execution.json'), timeout=1):
-        return _stop_project(caller_thread=caller_thread)
+        prior = state()
+        recorded = prior.get('user_stop') if prior.get('stopped') else None
+        if recorded and recorded.get('request_id') != request_id:
+            recorded = None
+        user_stop = (_direct_user_request(caller_thread, request_id, authorized, recorded)
+                     if request_id is not None else None)
+        return _stop_project(caller_thread=caller_thread, user_stop=user_stop)
 
 
 def recover_stop_driver(*, caller_thread, request_id, authorized=False):
@@ -871,7 +1141,8 @@ def recover_stop_driver(*, caller_thread, request_id, authorized=False):
     from ctypes import wintypes
     from app_server_control import RPC
     from process_stop import (collection_terminal, dedicated_owner, process_snapshot,
-                              protected_ancestors, targets_for, windows_argv)
+                              protected_ancestors, stop_owned_processes, targets_for,
+                              windows_argv)
     lock_path = RECOVERY.with_name('stop-execution.json.lock')
     with coordctl.StateLock(RECOVERY.with_name('stop-driver-recovery.json'), timeout=1):
         config, current = policy(), state()
@@ -933,6 +1204,17 @@ def recover_stop_driver(*, caller_thread, request_id, authorized=False):
                 raise ValueError('Interrupted stop remains incomplete; lock preserved')
             receipts = {}
             with RPC() as rpc:
+                # Reconcile fresh terminal IDs even when _stop_project returned
+                # an earlier complete receipt. The current recovery driver must
+                # survive to preserve the lock; every other terminal still has
+                # to pass the existing exact-owner stop verification.
+                process_receipt = stop_owned_processes(
+                    config, main, coordination, state(), PROJECT, rpc,
+                    caller_thread=caller_thread)
+                if not process_receipt.get('ok'):
+                    raise ValueError('Registered execution remains; lock preserved')
+                drivers = set(process_receipt.get('thread_terminals', {})
+                    .get(caller_thread, {}).get('protected_stop_drivers', []))
                 for owner, work in owners.items():
                     thread = rpc.call('thread/read', {'threadId': owner, 'includeTurns': False})['thread']
                     if (thread.get('id') != owner or Path(thread['cwd']).resolve()
@@ -953,6 +1235,7 @@ def recover_stop_driver(*, caller_thread, request_id, authorized=False):
                     if (thread.get('status') or {}).get('type') != 'notLoaded':
                         terminals = rpc.call('thread/backgroundTerminals/list', {'threadId': owner})
                         if (terminals.get('nextCursor') or any(collection_terminal(t, work, PROJECT)
+                                and not (owner == caller_thread and t['processId'] in drivers)
                                 for t in terminals.get('data', []))):
                             raise ValueError('A registered collection terminal remains; lock preserved')
                     receipts[owner] = {'goal_status': goal.get('status') if goal else None,
@@ -972,6 +1255,7 @@ def recover_stop_driver(*, caller_thread, request_id, authorized=False):
                 'cycle_started_at': current['cycle_started_at'], 'driver_pid': lock['pid'],
                 'driver_created_at': lock['created_at'], 'driver_exit_verified': True,
                 'lock_sha256': digest, 'preserved_lock': str(archive), 'targets': receipts,
+                'process_stop_receipt': process_receipt,
                 'gate_kept_closed': True, 'phase': 'verified_before_preserving_lock'}
             def save_proof(saved):
                 if not saved.get('stopped') or saved['cycle_started_at'] != current['cycle_started_at']:
@@ -1005,12 +1289,16 @@ def recover_stop_driver(*, caller_thread, request_id, authorized=False):
                 'preserved_lock': str(archive), 'gate_kept_closed': True}
 
 
-def _stop_project(*, caller_thread=None):
+def _stop_project(*, caller_thread=None, user_stop=None):
     config = policy()
     required = check()
-    if config.get('stop_authorized') is not True or not required['stop_required']:
-        return {'ok': True, 'status': 'no_expired_incident', 'stopped': False}
     old = state()
+    # A verified direct stop stays resumable after its driver is interrupted.
+    user_stop = user_stop or (old.get('user_stop') if old.get('stopped') else None)
+    if user_stop:
+        config = {**config, 'stop_authorized': True, 'force_process_stop_authorized': True}
+    if not user_stop and (config.get('stop_authorized') is not True or not required['stop_required']):
+        return {'ok': True, 'status': 'no_expired_incident', 'stopped': False}
     force_required = config.get('force_process_stop_authorized') is True
     if old.get('stop_complete') and (not force_required or old.get('process_stop_receipt', {}).get('ok')):
         return {'ok': True, 'stopped': True, 'status': 'already_stopped',
@@ -1019,14 +1307,17 @@ def _stop_project(*, caller_thread=None):
     with coordctl.StateLock(STATE, timeout=5):
         coordination = coordctl._read_state(STATE)
         coordination['collection_paused'] = True
-        coordination['collection_pause_reason'] = 'User one-hour unrecovered collector stop policy'
+        coordination['collection_pause_reason'] = ('Direct user stop' if user_stop else
+            'Seven consecutive programmes without a qualified cover' if required.get('cover_stop') else
+            'User two-hour unrecovered collector stop policy')
         coordctl._atomic_write(STATE, coordination)
     with coordctl.StateLock(MAIN, timeout=5):
         main = json.loads(MAIN.read_text('utf-8'))
-        main.update(paused=True, main_phase='one_hour_recovery_budget_stop')
+        main.update(paused=True, main_phase='direct_user_stop' if user_stop else
+                    'consecutive_cover_failure_stop' if required.get('cover_stop') else 'one_hour_recovery_budget_stop')
         save_json(MAIN, main)
     completed_urls = {slot: set() for slot in main['slots']}
-    start = datetime.fromisoformat(required['cycle_started_at'].replace('Z', '+00:00'))
+    start = datetime.fromisoformat(old['cycle_started_at'].replace('Z', '+00:00'))
     for row in coordination['batches'].values():
         if (row.get('state') == 'acknowledged'
                 and datetime.fromisoformat(row['acknowledged_at'].replace('Z', '+00:00')) >= start):
@@ -1036,12 +1327,17 @@ def _stop_project(*, caller_thread=None):
     completed = {slot: len(urls) for slot, urls in completed_urls.items()}
     def checkpoint(current):
         current.update(stopped=True, stopped_at=current.get('stopped_at') or utc_now(),
-                       stop_cause=required['incidents'], completed_captured_ack=completed,
+                       stop_cause=required.get('incidents', []), completed_captured_ack=completed,
                        reports=current.get('reports') or {'pending': True, 'delivered': False})
+        if user_stop:
+            current.update(stop_reason='direct_user_stop', user_stop=user_stop)
+        elif required.get('cover_stop'):
+            current.update(stop_reason='consecutive_cover_failure', cover_stop=required['cover_stop'])
         current.setdefault('thread_stop_receipts', {})
     mutate(checkpoint)
     targets = [value['owner'] for value in main['slots'].values()]
-    targets += [main['host_parent_thread'], main['main_thread']]
+    targets += ([main['main_thread']] if main.get('execution_mode') == 'single' else
+                [main['host_parent_thread'], main['main_thread']])
     receipts = {}
     process_receipt = None
     with RPC() as rpc:
@@ -1064,7 +1360,8 @@ def _stop_project(*, caller_thread=None):
                             or registered.get('role') not in {'collector', 'peer'}
                             or not registered.get('work')
                             or Path(registered['work']).resolve() != work
-                            or parent != main['host_parent_thread']):
+                            or (main.get('execution_mode') != 'single' and parent != main['host_parent_thread'])
+                            or (main.get('execution_mode') == 'single' and tid != main['main_thread'])):
                         raise ValueError('Refusing to stop a collector without its exact project work and original host binding')
                 elif tid not in {main['main_thread'], main['host_parent_thread']}:
                     raise ValueError('Refusing to stop an unregistered project control thread')
@@ -1102,14 +1399,14 @@ def _stop_project(*, caller_thread=None):
     mutate(saved)
     if caller_thread != main['main_thread'] and not state().get('stop_report_request_queued'):
         import subprocess
-        from app_server_control import SOCK, CODEX
+        from app_server_control import SOCK, codex_binary
         from production_sync import hidden_options
-        message = ('已触发用户唯一自动停工条件：采集线程连续故障超过3600秒未恢复。'
+        message = ('已触发用户自动停工条件：连续第7个节目无合格封面，或采集线程真实故障超过7200秒。'
                    '核验 .runtime/main-agent/recovery-current.json 的真实停工回执；'
                    '未完成时只补齐既有精确停工流程。对用户仅显示working，不发送周期汇报。'
                    'Goal已按用户授权暂停；不得恢复、领批或新建线程。')
         try:
-            delivered = subprocess.run([CODEX, 'queue', '--remote', 'unix://' + SOCK.replace('\\', '/'),
+            delivered = subprocess.run([codex_binary(), 'queue', '--remote', 'unix://' + SOCK.replace('\\', '/'),
                                     '--thread', main['main_thread'], '--message', message],
                                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                                    stderr=subprocess.DEVNULL, timeout=20, **hidden_options())
@@ -1117,8 +1414,8 @@ def _stop_project(*, caller_thread=None):
         except Exception as error:
             mutate(lambda current: current.update(stop_report_request_error=type(error).__name__))
     return {'ok': state()['stop_complete'], 'stopped': True,
-            'cycle': check()['cycle_started_at'], 'completed_captured_ack': completed,
-            'expired_slots': [v['slot'] for v in required['incidents'] if v['expired']],
+            'cycle': state()['cycle_started_at'], 'completed_captured_ack': completed,
+            'expired_slots': [v['slot'] for v in required.get('incidents', []) if v['expired']],
             'thread_stop_receipts': receipts, 'process_stop_receipt': process_receipt,
             'checkpoint': str(RECOVERY)}
 
@@ -1128,8 +1425,158 @@ def guard(caller_thread=None):
     if status['stop_required']:
         if not status.get('stopped') or not state().get('stop_complete'):
             stop_project(caller_thread=caller_thread)
-        raise RuntimeError('Project stopped by one-hour recovery policy; durable checkpoint=' + str(RECOVERY))
+        raise RuntimeError('Project stopped by cover-failure or two-hour recovery policy; durable checkpoint=' + str(RECOVERY))
     return status
+
+
+def recover_workflow_lock(*, caller_thread, owner, batch_id, authorized=False):
+    """Preserve a dead writer's lock after a verified, explicit project restart."""
+    import ctypes
+    from ctypes import wintypes
+    from app_server_control import RPC
+
+    if (not authorized or os.name != 'nt' or caller_thread != os.environ.get('CODEX_THREAD_ID')
+            or caller_thread != policy().get('main_thread')):
+        raise ValueError('Workflow lock recovery requires the authorized Windows business main')
+    slot, binding = slot_for(owner)
+    work = Path(binding['work']).resolve()
+    if not work.is_relative_to(PROJECT.resolve()) or binding.get('registration_verified') is not True:
+        raise ValueError('Workflow lock owner/work is not the registered project slot')
+    with coordctl.StateLock(RECOVERY.with_name('stop-execution.json'), timeout=5):
+        current = state()
+        prior = current.get('previous_cycles', [])
+        stopped = prior[-1]['state'] if prior else {}
+        old_terminals = stopped.get('process_stop_receipt', {}).get('thread_terminals', {}).get(owner, {})
+        coordination = coordctl._read_state(STATE)
+        batch = coordination.get('batches', {}).get(batch_id, {})
+        peer = coordination.get('threads', {}).get(owner, {})
+        if (current.get('stopped') or not current.get('user_resume', {}).get('gate_opened')
+                or not stopped.get('stop_complete') or not old_terminals.get('ok')
+                or not old_terminals.get('terminated') or coordination.get('collection_paused')
+                or batch.get('state') != 'ready' or batch.get('thread') != owner
+                or peer.get('active_batch') != batch_id or Path(batch.get('work', '')).resolve() != work):
+            raise ValueError('Lock recovery requires the original ready batch and verified prior writer stop')
+        with RPC() as rpc:
+            thread = rpc.call('thread/read', {'threadId': owner, 'includeTurns': False})['thread']
+            if (thread.get('status', {}).get('type') != 'idle'
+                    or thread.get('parentThreadId') != binding['host_parent']
+                    or Path(thread.get('cwd', '')).resolve() not in {PROJECT.resolve(), PROJECT.parent.resolve()}):
+                raise ValueError('Original owner must be idle with its registered native parent/cwd')
+            terminals = rpc.call('thread/backgroundTerminals/list', {'threadId': owner})
+            if terminals.get('data') or terminals.get('nextCursor'):
+                raise ValueError('Original owner still has a native background command')
+        lock_path = work / '.workflowctl.lock'
+        if not lock_path.exists():
+            return {'ok': True, 'status': 'no_workflow_lock', 'slot': slot}
+        if lock_path.is_symlink():
+            raise ValueError('Workflow lock must be the exact local file')
+        kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+        kernel.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+            wintypes.LPVOID, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+        kernel.CreateFileW.restype = wintypes.HANDLE
+        kernel.ReadFile.argtypes = [wintypes.HANDLE, wintypes.LPVOID, wintypes.DWORD,
+            ctypes.POINTER(wintypes.DWORD), wintypes.LPVOID]
+        kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel.OpenProcess.restype = wintypes.HANDLE
+        kernel.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        kernel.WaitForSingleObject.restype = wintypes.DWORD
+        kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel.SetFileInformationByHandle.argtypes = [wintypes.HANDLE, ctypes.c_int,
+            wintypes.LPVOID, wintypes.DWORD]
+        handle = kernel.CreateFileW(str(lock_path), 0x80000000 | 0x00010000, 0, None, 3, 0x00200000, None)
+        if handle == wintypes.HANDLE(-1).value:
+            raise ctypes.WinError(ctypes.get_last_error())
+        process = None
+        try:
+            buffer, length = ctypes.create_string_buffer(4096), wintypes.DWORD()
+            if not kernel.ReadFile(handle, buffer, len(buffer), ctypes.byref(length), None):
+                raise ctypes.WinError(ctypes.get_last_error())
+            if not 0 < length.value < len(buffer):
+                raise ValueError('Invalid workflow lock size')
+            raw = buffer.raw[:length.value]
+            lock = json.loads(raw)
+            if (set(lock) != {'pid', 'created_at', 'token'} or type(lock['pid']) is not int
+                    or lock['pid'] <= 0 or not re.fullmatch(r'[0-9a-f]{48}', lock.get('token', ''))):
+                raise ValueError('Invalid original workflow lock identity')
+            created = datetime.fromisoformat(lock['created_at'].replace('Z', '+00:00'))
+            if not (datetime.fromisoformat(stopped['cycle_started_at'].replace('Z', '+00:00'))
+                    <= created <= datetime.fromisoformat(stopped['stopped_at'].replace('Z', '+00:00'))):
+                raise ValueError('Workflow lock is not from the verified stopped cycle')
+            process = kernel.OpenProcess(0x1000 | 0x100000, False, lock['pid'])
+            if process:
+                if kernel.WaitForSingleObject(process, 0) != 0:
+                    raise ValueError('Writer or reused PID is alive; workflow lock preserved')
+            elif ctypes.get_last_error() != 87:
+                raise ctypes.WinError(ctypes.get_last_error())
+            digest = hashlib.sha256(raw).hexdigest()
+            archive = work / f'.workflowctl.interrupted-{digest}.json'
+            proof = {'slot': slot, 'owner': owner, 'batch': batch_id, 'lock_sha256': digest,
+                     'preserved_lock': str(archive), 'prior_cycle': stopped['cycle_started_at'],
+                     'prior_terminals': old_terminals, 'at': utc_now(), 'phase': 'writer_verified_dead'}
+            mutate(lambda saved: saved.setdefault('workflow_lock_recoveries', []).append(proof))
+            class RenameInfo(ctypes.Structure):
+                _fields_ = [('ReplaceIfExists', wintypes.BOOLEAN), ('RootDirectory', wintypes.HANDLE),
+                            ('FileNameLength', wintypes.DWORD), ('FileName', wintypes.WCHAR * 1)]
+            name = str(archive).encode('utf-16-le')
+            size = RenameInfo.FileName.offset + len(name)
+            rename = ctypes.create_string_buffer(max(size, ctypes.sizeof(RenameInfo)))
+            info = RenameInfo.from_buffer(rename)
+            info.FileNameLength = len(name)
+            ctypes.memmove(ctypes.addressof(rename) + RenameInfo.FileName.offset, name, len(name))
+            if not kernel.SetFileInformationByHandle(handle, 3, rename, size):
+                raise ctypes.WinError(ctypes.get_last_error())
+        finally:
+            if process:
+                kernel.CloseHandle(process)
+            kernel.CloseHandle(handle)
+        if lock_path.exists() or hashlib.sha256(archive.read_bytes()).hexdigest() != digest:
+            raise ValueError('Original workflow lock preservation did not verify')
+        mutate(lambda saved: saved['workflow_lock_recoveries'][-1].update(
+            phase='original_lock_preserved', verified_at=utc_now()))
+        return {'ok': True, 'status': 'original_workflow_lock_preserved', 'slot': slot,
+                'batch': batch_id, 'lock_sha256': digest, 'claim_and_fault_budget_preserved': True}
+
+
+def _resume_host_pause(caller_thread, request_id, authorized):
+    """Resume an explicit native-host pause without resetting the fault cycle."""
+    from app_server_control import RPC
+    proof = _direct_user_request(caller_thread, request_id, authorized)
+    main = json.loads(MAIN.read_text('utf-8'))
+    coordination = coordctl._read_state(STATE)
+    reason = coordination.get('collection_pause_reason') or ''
+    if (main.get('main_thread') != caller_thread
+            or coordination.get('collection_active_owner') != caller_thread
+            or not reason.startswith(('Native server Goal is ', 'Server collector service stop requested'))):
+        raise ValueError('Only the original server host pause can continue in this cycle')
+    if check().get('stop_required'):
+        raise ValueError('Complete the required formal stop before an explicit restart')
+    with RPC() as rpc:
+        goal = rpc.call('thread/goal/get', {'threadId': caller_thread}).get('goal')
+        if not goal:
+            raise ValueError('Original native Goal is missing')
+        if goal.get('status') in {'paused', 'blocked'}:
+            rpc.call('thread/goal/set', {'threadId': caller_thread, 'status': 'active', 'origin': 'automatic'})
+        actual = rpc.call('thread/goal/get', {'threadId': caller_thread}).get('goal')
+        if not actual or actual.get('status') != 'active':
+            raise ValueError('Native Goal did not actually resume')
+    continuation = {**proof, 'at': utc_now(), 'cycle_preserved': True}
+    mutate(lambda saved: saved.setdefault('user_continuations', []).append(continuation))
+    with coordctl.StateLock(MAIN, timeout=5):
+        main = json.loads(MAIN.read_text('utf-8'))
+        if main.get('main_thread') != caller_thread:
+            raise ValueError('Original server main changed')
+        main.update(paused=False, main_phase='server_collection', collection_continuation=continuation)
+        save_json(MAIN, main)
+    with coordctl.StateLock(STATE, timeout=5):
+        coordination = coordctl._read_state(STATE)
+        if (coordination.get('collection_active_owner') != caller_thread
+                or coordination.get('collection_pause_reason') != reason
+                or coordination.get('cover_outcomes', {}).get('stop_required')):
+            raise ValueError('Original server pause changed before the gate could open')
+        coordination.update(collection_paused=False, collection_pause_reason=None)
+        coordctl._atomic_write(STATE, coordination)
+    return {'ok': True, 'status': 'continued_by_direct_user', 'cycle_reset': False,
+            'native_goal_status': actual['status'], 'identities_and_batches_preserved': True}
 
 
 def resume_project(*, caller_thread, request_id, authorized=False):
@@ -1150,9 +1597,12 @@ def resume_project(*, caller_thread, request_id, authorized=False):
                 for row in current.get('previous_cycles', []))):
             raise ValueError('A completed restart request cannot restart a later stop')
         if not current.get('stopped') and not continuing:
+            if coordctl._read_state(STATE).get('collection_paused'):
+                return _resume_host_pause(caller_thread, request_id, authorized)
             return {'ok': True, 'status': 'already_running', 'cycle_reset': False}
         if current.get('stopped') and not current.get('stop_complete'):
             raise ValueError('Verify the original project stop before restarting')
+        _direct_user_request(caller_thread, request_id, authorized)
         main = json.loads(MAIN.read_text('utf-8'))
         if main.get('main_thread') != caller_thread:
             raise ValueError('Business main identity changed')
@@ -1160,24 +1610,19 @@ def resume_project(*, caller_thread, request_id, authorized=False):
             coordination = coordctl._read_state(STATE)
             if not continuing and not coordination.get('collection_paused'):
                 raise ValueError('Stopped recovery ledger disagrees with the shared gate')
+        with coordctl.StateLock(POLICY, timeout=5):
+            config = policy()
+            config['recovery_budget_seconds'] = RECOVERY_BUDGET_SECONDS
+            save_json(POLICY, config)
         # The native user lifecycle is changed only for this explicit resume.
         with RPC() as rpc:
             goal = rpc.call('thread/goal/get', {'threadId': caller_thread}).get('goal')
             if not goal:
-                adoption = main.get('main_identity_adoption', {})
-                if (caller_thread != os.environ.get('CODEX_THREAD_ID')
-                        or adoption.get('to') != caller_thread
-                        or adoption.get('authorization') != 'direct_user'):
-                    raise ValueError('Persistent Goal missing; no authorized main adoption')
-                thread = rpc.call('thread/read', {'threadId': caller_thread,
-                                                 'includeTurns': False})['thread']
-                if thread.get('id') != caller_thread or Path(thread['cwd']).resolve() not in {
-                        PROJECT.resolve(), PROJECT.resolve().parent}:
-                    raise ValueError('The adopting user main is not the current native thread')
+                raise ValueError('Persistent Goal missing; start this business main native Goal before resuming')
             elif goal.get('status') == 'paused':
-                rpc.call('thread/goal/set', {'threadId': caller_thread, 'status': 'active'})
+                rpc.call('thread/goal/set', {'threadId': caller_thread, 'status': 'active','origin':'automatic'})
             actual = rpc.call('thread/goal/get', {'threadId': caller_thread}).get('goal')
-            if goal and (not actual or actual.get('status') != 'active'):
+            if not actual or actual.get('status') != 'active':
                 raise ValueError('Native Goal did not actually resume')
         if not continuing:
             def begin(saved):
@@ -1203,15 +1648,87 @@ def resume_project(*, caller_thread, request_id, authorized=False):
             save_json(MAIN, main)
         with coordctl.StateLock(STATE, timeout=5):
             coordination = coordctl._read_state(STATE)
+            covers = coordination.get('cover_outcomes', {})
+            if covers.get('stop_required'):
+                # Only this explicit, verified user restart acknowledges the
+                # old stop latch. The consecutive programme IDs are preserved.
+                covers.setdefault('stop_history', []).append({
+                    'stop': covers.pop('stop_required'),
+                    'driver': covers.pop('stop_driver', None),
+                    'driver_error': covers.pop('stop_driver_error', None),
+                    'user_resume': state()['user_resume'],
+                })
             coordination['collection_paused'] = False
             coordination['collection_pause_reason'] = None
             coordctl._atomic_write(STATE, coordination)
         mutate(lambda saved: saved['user_resume'].update(gate_opened=True))
         return {'ok': True, 'status': 'resumed_by_direct_user',
                 'cycle_started_at': state()['cycle_started_at'],
-                'native_goal_status': actual.get('status') if actual else None,
-                'control_mode': 'native_goal' if actual else 'explicit_current_user_main',
+                'native_goal_status': actual['status'],
+                'control_mode': 'native_goal',
                 'identities_and_batches_preserved': True}
+
+
+def _adopt_single_execution(caller_thread, prior, adoption, save_adoption):
+    """Apply the verified native handoff to the sole collector and its checkpoint."""
+    from contextlib import ExitStack
+    from single_agentctl import handoff_single_execution, sha
+    with ExitStack() as locks:
+        for path in (STATE, MAIN, POLICY):
+            locks.enter_context(coordctl.StateLock(path, timeout=5))
+        coordination = coordctl._read_state(STATE)
+        main = json.loads(MAIN.read_text('utf-8'))
+        config = policy()
+        if (main['main_thread'] != prior or config['main_thread'] != prior
+                or coordination.get('collection_active_owner') != prior
+                or coordination.get('collection_paused') or check().get('stop_required')):
+            raise ValueError('Original single execution changed before handoff')
+        binding = main['slots']['main']
+        old_work = Path(binding['work']).resolve()
+        from process_stop import process_snapshot, dedicated_owner, windows_argv
+        if any(row.get('ExecutablePath') and row.get('CommandLine')
+               and dedicated_owner(windows_argv(row['CommandLine']), row['ExecutablePath'],
+                                   {prior:old_work}, PROJECT) == prior
+               for row in process_snapshot()):
+            raise ValueError('Original dedicated collector/browser is still running')
+        checkpoint = old_work / 'playwright-discovery.json'
+        saved = json.loads(checkpoint.read_text('utf-8'))
+        if binding['owner'] != prior or saved.get('owner') != prior or saved.get('action_inflight'):
+            raise ValueError('Original discovery owner/action requires reconciliation')
+        work = PROJECT / 'Datebase/xxmanmi-resource-db/.runtime/collection-workers' / ('main-'+caller_thread)
+        if work.exists() or work.is_symlink():
+            raise ValueError('Receiver collection directory already exists')
+        staged = json.loads(json.dumps(coordination))
+        staged['collection_paused'] = True
+        receipt = handoff_single_execution(staged, prior, caller_thread, work, adoption['authorization'])
+        receipt['original_checkpoint_sha256'] = sha(saved)
+        saved.update(owner=caller_thread, execution_handoff=receipt)
+        work.mkdir(parents=True)
+        save_json(work/'playwright-discovery.json', saved)
+        # Close first and open last: a partial persistent update cannot run either owner.
+        coordination['collection_paused'] = True
+        coordination['collection_pause_reason'] = 'Explicit single execution handoff'
+        coordctl._atomic_write(STATE, coordination)
+        staged['collection_pause_reason'] = coordination['collection_pause_reason']
+        coordctl._atomic_write(STATE, staged)
+        main.update(main_thread=caller_thread, title_discovery_owner=caller_thread,
+            main_identity_adoption=adoption, slots={'main':{**binding,'owner':caller_thread,'work':str(work)}},
+            single_execution_handoff=receipt)
+        save_json(MAIN, main)
+        config.update(main_thread=caller_thread, main_identity_adoption=adoption)
+        save_json(POLICY, config)
+        def update_ledger(current):
+            save_adoption(current)
+            incident = current.get('incidents', {}).get('main')
+            if incident and not incident.get('resolved_at'):
+                incident.setdefault('execution_handoffs', []).append(receipt)
+                incident['owner'] = caller_thread
+        mutate(update_ledger)
+        staged.update(collection_paused=False, collection_pause_reason=None)
+        coordctl._atomic_write(STATE, staged)
+        return {'ok':True, 'main_thread':caller_thread, 'prior_main':prior,
+                'single_execution_transferred':True, 'work':str(work),
+                'checkpoint_and_history_preserved':True, 'gate_kept_closed':False}
 
 
 def adopt_main(*, caller_thread, request_id, authorized=False, live_handoff=False):
@@ -1225,6 +1742,8 @@ def adopt_main(*, caller_thread, request_id, authorized=False, live_handoff=Fals
         current = state()
         main = json.loads(MAIN.read_text('utf-8'))
         coordination = coordctl._read_state(STATE)
+        request = (_direct_user_request(caller_thread, request_id, authorized, require_main=False)
+                   if coordination.get('execution_mode') == 'single' else None)
         stopped_handoff = (current.get('stopped') and current.get('stop_complete')
                            and main.get('paused') and coordination.get('collection_paused'))
         if not stopped_handoff and not live_handoff:
@@ -1280,6 +1799,8 @@ def adopt_main(*, caller_thread, request_id, authorized=False, live_handoff=Fals
                     'collectors_preserved': True, 'host_preserved': True}
         if handoff_proof:
             adoption['live_handoff'] = handoff_proof
+        if request:
+            adoption['authorization'] = request
         def save_adoption(saved):
             if live_handoff and check().get('stop_required'):
                 raise ValueError('Fault deadline reached during main handoff')
@@ -1287,6 +1808,10 @@ def adopt_main(*, caller_thread, request_id, authorized=False, live_handoff=Fals
             if previous_adoption and previous_adoption != adoption:
                 saved.setdefault('main_identity_history', []).append(previous_adoption)
             saved['main_identity_adoption'] = adoption
+        if coordination.get('execution_mode') == 'single':
+            if not live_handoff or not handoff_proof:
+                raise ValueError('Single execution transfer requires verified terminal live handoff')
+            return _adopt_single_execution(caller_thread, prior, adoption, save_adoption)
         mutate(save_adoption)
         with coordctl.StateLock(MAIN, timeout=5):
             main = json.loads(MAIN.read_text('utf-8'))
@@ -1428,9 +1953,155 @@ def bind_replacement(*, caller_thread, request_id, slot, previous_owner,
                     'deadline': incident['deadline'], 'budget_preserved': True, 'replay_authorized': False}
 
 
+def rebind_roster(*, caller_thread, request_id, roster_file, authorized=False):
+    """Bind a user-requested fresh roster while retaining all retired evidence."""
+    from app_server_control import RPC
+    from contextlib import ExitStack
+    roster = json.loads(Path(roster_file).read_text('utf-8'))
+    slots = {'01', '02', '03', '04'}
+    if (not isinstance(roster, dict) or set(roster) != slots
+            or any(not isinstance(owner, str) or not re.fullmatch(
+                r'[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}', owner) for owner in roster.values())
+            or len(set(roster.values())) != 4):
+        raise ValueError('Roster must map exactly 01-04 to four distinct native UUIDs')
+    with coordctl.StateLock(RECOVERY.with_name('stop-execution.json'), timeout=5):
+        pending = state().get('roster_rebuild', {})
+        recorded = pending.get('request') if pending.get('request_id') == request_id and pending.get('roster') == roster else None
+        request = _direct_user_request(caller_thread, request_id, authorized, recorded)
+        with ExitStack() as locks:
+            for path in (STATE, RECOVERY, MAIN, POLICY):
+                locks.enter_context(coordctl.StateLock(path, timeout=5))
+            current, config = state(), policy()
+            main = json.loads(MAIN.read_text('utf-8'))
+            coordination = coordctl._read_state(STATE)
+            resume = current.get('user_resume', {})
+            if (current.get('stopped') or check()['stop_required'] or main.get('paused')
+                    or coordination.get('collection_paused') or not resume.get('gate_opened')
+                    or resume.get('request_id') != request_id or resume.get('owner') != caller_thread
+                    or resume.get('authorization') != 'direct_user'
+                    or caller_thread != main.get('main_thread') or caller_thread != config.get('main_thread')
+                    or main.get('host_parent_thread') != config.get('host_parent_thread')
+                    or main.get('host_parent_thread') == caller_thread):
+                raise ValueError('Roster binding requires the current explicit restart and unchanged main/relay')
+            prior = current.get('previous_cycles', [])[-1:] or [{}]
+            stopped = prior[0].get('state', {})
+            digest = hashlib.sha256(json.dumps(stopped, sort_keys=True, ensure_ascii=False,
+                separators=(',', ':')).encode('utf-8')).hexdigest()
+            existing = current.get('roster_rebuild')
+            if existing and (existing.get('request_id') != request_id or existing.get('roster') != roster):
+                raise ValueError('Conflicting roster rebuild in this restart cycle')
+            bindings = existing['prior_bindings'] if existing else main.get('slots', {})
+            old_owners = {entry['owner'] for entry in bindings.values()}
+            if (set(bindings) != slots or len(old_owners) != 4 or old_owners & set(roster.values())
+                    or set(coordination.get('threads', {})) != set(roster.values())
+                    or set(roster.values()) & set(coordination.get('retired_threads', {}))
+                    or digest != prior[0].get('sha256') or not stopped.get('stopped')
+                    or not stopped.get('stop_complete') or not stopped.get('process_stop_receipt', {}).get('ok')
+                    or stopped.get('stop_reason') != 'direct_user_stop'
+                    or stopped.get('user_stop', {}).get('owner') != caller_thread
+                    or stopped.get('user_stop', {}).get('request_id') == request_id
+                    or any(not stopped.get('thread_stop_receipts', {}).get(owner, {}).get('ok')
+                           for owner in old_owners | {caller_thread, main['host_parent_thread']})
+                    or any(not row.get('resolved_at') for row in current.get('incidents', {}).values())):
+                raise ValueError('A complete direct-user stop and exact retired/fresh rosters are required')
+            hashes, native_proof, replacements = {}, {}, {}
+            cleanup = STATE.parent.parent / 'cleanup'
+            with RPC() as rpc:
+                for slot, previous in bindings.items():
+                    owner, replacement = previous['owner'], roster[slot]
+                    original_work = Path(previous['work'])
+                    work = original_work.resolve()
+                    paths = {name: cleanup / f'{name}-{owner}.json' for name in ('owner', 'stop')}
+                    proof = {name: json.loads(path.read_text('utf-8')) for name, path in paths.items()}
+                    hashes.update({str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in paths.values()})
+                    retired = coordination.get('retired_threads', {}).get(owner, {})
+                    evidence = proof['stop']
+                    if (proof['owner'].get('owner') != owner or evidence.get('thread') != owner
+                            or evidence.get('user_authorized') is not True or evidence.get('owner_stopped') is not True
+                            or any(not isinstance(evidence.get(k), str) or not evidence[k].strip() for k in ('method', 'summary'))
+                            or proof['owner'].get('evidence') != evidence or retired.get('evidence') != evidence
+                            or Path(proof['owner']['original_registration']['work']).resolve() != work
+                            or Path(retired.get('work', '')).resolve() != work or retired.get('active_batch')
+                            or Path(retired.get('cleanup_receipt', '')).resolve() != paths['owner'].resolve()
+                            or not work.is_dir() or original_work.is_symlink() or work != original_work.absolute()
+                            or (hasattr(original_work, 'is_junction') and original_work.is_junction())
+                            or not work.is_relative_to(PROJECT.resolve())
+                            or coordctl._snapshot_handoff_journals(str(work)) != evidence.get('journals')
+                            or any(row.get('thread') == owner and row.get('state') in {'claimed', 'ready'}
+                                   for row in coordination.get('batches', {}).values())):
+                        raise ValueError('Retired owner stop/cleanup/journals do not match preserved evidence')
+                    for cancelled in proof['owner'].get('cancelled_batches', []):
+                        batch = coordination['batches'].get(cancelled['batch_id'], {})
+                        if (batch.get('thread') != owner or batch.get('state') != 'released'
+                                or batch.get('logs_stopped') is not True
+                                or any(coordination.get('items', {}).get(url, {}).get('state') != 'manual_review'
+                                       for url in cancelled.get('item_urls', []))):
+                            raise ValueError('Cancelled work must remain released and pending manual review')
+                    for identity, fresh in ((owner, False), (replacement, True)):
+                        thread = rpc.call('thread/read', {'threadId': identity, 'includeTurns': False})['thread']
+                        turns = rpc.call('thread/turns/list', {'threadId': identity, 'limit': 1,
+                            'sortDirection': 'desc', 'itemsView': 'full'}).get('data', [])
+                        turn = turns[0] if turns else {}
+                        goal = rpc.call('thread/goal/get', {'threadId': identity}).get('goal')
+                        unloaded = thread.get('status', {}).get('type') == 'notLoaded'
+                        commands = {'data': []} if unloaded else rpc.call('thread/backgroundTerminals/list', {'threadId': identity})
+                        if (thread.get('id') != identity or thread.get('parentThreadId') != main['host_parent_thread']
+                                or Path(thread['cwd']).resolve() not in {PROJECT.resolve(), PROJECT.parent.resolve()}
+                                or turn.get('status') not in {'completed', 'interrupted', 'failed'}
+                                or any(item.get('status') in {'inProgress', 'running', 'pending'}
+                                       for item in turn.get('items', []) if item.get('type') != 'reasoning')
+                                or (goal is not None if fresh else bool(goal and goal.get('status') != 'paused'))
+                                or commands.get('data') or commands.get('nextCursor')
+                                or (fresh and (thread.get('model') != 'gpt-6-luna'
+                                    or thread.get('reasoningEffort') != 'medium' or thread.get('forkedFromId') is not None))):
+                            raise ValueError('Old/new native owner is not at its authorized terminal checkpoint')
+                        native_proof[identity] = {'turn_id': turn['id'], 'turn_status': turn['status'],
+                            'goal_status': goal.get('status') if goal else None, 'runtime_status': thread.get('status'),
+                            'background_verification': 'not_loaded_after_verified_stop' if unloaded and not fresh else
+                                'not_loaded_terminal_registration' if unloaded else 'empty_native_inventory'}
+                        if fresh:
+                            task_name = thread['source']['subAgent']['thread_spawn']['agent_path']
+                    registered = coordination['threads'][replacement]
+                    expected = PROJECT.resolve() / 'Datebase/xxmanmi-resource-db/.runtime/collection-workers' / (slot + '-' + replacement)
+                    registered_work = Path(registered.get('work', ''))
+                    new_work = registered_work.resolve()
+                    if (registered.get('role') not in {'collector', 'peer'} or registered.get('active_batch')
+                            or new_work != expected or registered_work.absolute() != expected or not new_work.is_dir()
+                            or registered_work.is_symlink()
+                            or (hasattr(registered_work, 'is_junction') and registered_work.is_junction())
+                            or any(row.get('thread') == replacement for row in coordination.get('batches', {}).values())):
+                        raise ValueError('Fresh owner must have only its independent idle registration')
+                    replacements[slot] = {'owner': replacement, 'work': str(new_work), 'host_parent': main['host_parent_thread'],
+                        'task_name': task_name, 'browser_group': slot, 'model': 'gpt-6-luna', 'reasoning_effort': 'medium',
+                        'registration_verified': True, 'classification_enabled': False, 'title_discovery_enabled': False,
+                        'replaces': owner}
+            if (main.get('slots') not in (bindings, replacements) or check()['stop_required']
+                    or any(hashlib.sha256(Path(path).read_bytes()).hexdigest() != digest for path, digest in hashes.items())
+                    or any(coordctl._snapshot_handoff_journals(v['work']) !=
+                        json.loads((cleanup / ('stop-' + v['owner'] + '.json')).read_text('utf-8'))['journals']
+                        for v in bindings.values())):
+                raise ValueError('Roster, receipts, journals, or recovery gate changed before binding')
+            change = {'request_id': request_id, 'request': request, 'roster': roster, 'prior_bindings': bindings,
+                'at': existing['at'] if existing else utc_now(), 'cycle_started_at': current['cycle_started_at'],
+                'prior_stop_sha256': prior[0]['sha256'], 'cleanup_receipt_sha256': hashes,
+                'native_registration': native_proof, 'old_sessions_and_work_preserved': True,
+                'replay_authorized': False, 'phase': 'prepared'}
+            current['roster_rebuild'] = change
+            save_json(RECOVERY, current)
+            change['phase'] = 'bound'
+            main.update(slots=replacements, roster_rebuild=change)
+            save_json(MAIN, main)
+            config['roster_rebuild'] = change
+            save_json(POLICY, config)
+            save_json(RECOVERY, current)
+            return {'ok': True, 'status': 'fresh_roster_bound', 'roster': roster,
+                'cycle_started_at': current['cycle_started_at'], 'old_sessions_and_work_preserved': True,
+                'replay_authorized': False}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('command', choices=['init', 'plan', 'record', 'tighten-budget', 'progress', 'check', 'stop', 'recover-stop-driver', 'resume', 'adopt-main', 'bind-replacement'])
+    parser.add_argument('command', choices=['init', 'plan', 'record', 'tighten-budget', 'progress', 'check', 'stop', 'recover-stop-driver', 'recover-workflow-lock', 'resume', 'adopt-main', 'bind-replacement', 'rebind-roster'])
     parser.add_argument('--thread')
     parser.add_argument('--error')
     parser.add_argument('--error-file', type=Path)
@@ -1439,10 +2110,11 @@ def main():
     parser.add_argument('--search-receipt', type=Path)
     parser.add_argument('--browser-source-tool')
     parser.add_argument('--authorized', action='store_true')
-    parser.add_argument('--request-id', help='Actual explicit user restart request identifier')
+    parser.add_argument('--request-id', help='Actual explicit user stop/restart request identifier')
     parser.add_argument('--slot', choices=['01', '02', '03', '04'])
     parser.add_argument('--owner', help='Exact cleaned previous owner')
     parser.add_argument('--replacement', help='Native replacement registered with its own independent work')
+    parser.add_argument('--roster-file', type=Path, help='Exact JSON mapping of slots 01-04 to fresh native UUIDs')
     parser.add_argument('--live-handoff', action='store_true',
                         help='Explicit main-only handoff after the previous main is terminal; preserve the running cycle')
     args = parser.parse_args()
@@ -1468,10 +2140,14 @@ def main():
     elif args.command == 'check':
         result = check()
     elif args.command == 'stop' and args.authorized:
-        result = stop_project(caller_thread=args.thread)
+        result = stop_project(caller_thread=args.thread, request_id=args.request_id,
+                              authorized=args.authorized)
     elif args.command == 'recover-stop-driver':
         result = recover_stop_driver(caller_thread=args.thread, request_id=args.request_id,
                                      authorized=args.authorized)
+    elif args.command == 'recover-workflow-lock':
+        result = recover_workflow_lock(caller_thread=args.thread, owner=args.owner,
+                                       batch_id=args.batch, authorized=args.authorized)
     elif args.command == 'resume' and args.authorized and args.thread and args.request_id:
         result = resume_project(caller_thread=args.thread, request_id=args.request_id,
                                 authorized=True)
@@ -1482,6 +2158,9 @@ def main():
         result = bind_replacement(caller_thread=args.thread, request_id=args.request_id,
             slot=args.slot, previous_owner=args.owner, replacement_owner=args.replacement,
             authorized=args.authorized)
+    elif args.command == 'rebind-roster' and args.roster_file:
+        result = rebind_roster(caller_thread=args.thread, request_id=args.request_id,
+                              roster_file=args.roster_file, authorized=args.authorized)
     else:
         parser.error('Missing required owner/error or explicit stop authorization')
     print(json.dumps(result, ensure_ascii=False, sort_keys=True))

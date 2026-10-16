@@ -1,6 +1,6 @@
 ---
 name: manying-wechat-publisher
-description: 为漫映Manying微信公众号制作并发布有事实依据的影视和动漫图文，轮换文章类型与风格，以真实相关配图和短段落表达；用本地CLI完成素材、排版、去重和断点管理，微信后台发布使用已登录浏览器。用于公众号选题、写稿、发布和恢复，不用于微信群聊或漫映网站部署。
+description: 为漫映Manying微信公众号选题、写稿、配图并发布影视动漫文章。通过本地Python/Playwright RPA持续会话完成编辑、封面、声明、保存、发表和公开页核验，不使用浏览器工具。支持去重、扫码交接和断点恢复，不用于微信群聊或漫映网站部署。
 ---
 
 # 漫映公众号发文
@@ -17,20 +17,21 @@ description: 为漫映Manying微信公众号制作并发布有事实依据的影
 
 ## 范围与运行方式
 
+- 2026-10-15最新用户决定：公众号不在服务器执行，回到本机按当次授权有界发布。服务器发文服务、定时器和专属国内转发已停用，稿件与历史保留；不得依据旧部署说明自动恢复。网站与服务器采集继续按各自约定运行。
 - 当前会话已有明确的漫映发文授权时，正常稿件不逐篇重复请示；仅写技能、讨论方案、准备草稿不等于发布授权。发布前核对后台账号确为漫映Manying。
 - 本技能不修改漫映网站、不动采集线程、不重启其他服务。微信登录、管理员扫码、验证码及新增法律声明由用户处理，不绕过。
-- CLI只处理本地文件、公开图片下载和状态记录，不读取微信凭据，不模拟微信协议，不直接发送文章。
-- 持续发布依赖实际运行的会话或已配置的产品调度机制。未配置调度时不要声称后台会自动发文，也不因创建技能而注册后台任务。没有明确频率时先做好当前稿，再约定后续节奏，避免连续刷屏。
+- 后台统一使用本地Python/Playwright RPA，不调用CUA、浏览器插件或浏览器工具，也不在异常时自动切换过去。`publisherctl.py`负责稿件与记录，`rpa_session.py`保持同一独立Chrome会话，`wechat_rpa.py`实现正常界面操作；`rpa_browser.py`保留诊断、登录和有界草稿计划。不读取或复制原用户Chrome的Cookie、登录存储，不调用微信私有发布接口。
+- 持续发布依赖实际运行的会话或已配置的调度机制。本机发文按当前明确授权的篇数执行，默认不额外群发通知；仅创建或维护技能不启动发文。原服务器每天12:00和18:30各3篇的安排已被用户撤销，[服务器自动发文](references/server-automation.md)仅保留历史恢复资料。
 
 ## CLI优先与最短上下文
 
-脚本：`scripts/publisherctl.py`，仅依赖Python标准库。运行 `python <脚本路径> --help` 查看命令；每个命令输出一份有界JSON。
+稿件脚本：`scripts/publisherctl.py`，仅依赖Python标准库。后台使用`scripts/rpa_session.py`，另需Playwright和已安装的Chrome/Chromium。用`exec_command`启动持续进程，再用`write_stdin`发送逐行JSON请求；Windows使用`tty:true`，后台驱动创建时隐藏。命令和会话复用见[本地RPA后台操作](references/rpa-publishing.md)。只读取当前阶段的有界DOM摘要与必要截图。
 
-工作目录沿用用户项目的文章目录；本机默认 `./.runtime/manying-articles`。一次只维护当前文章；先看状态，别把整个历史、浏览器文档和正文重复加载进上下文。
+工作目录沿用用户项目的文章目录；本机默认 `C:/Users/Admin/Desktop/codex/xxmanmi-video-downloader/.runtime/manying-articles`。一次只维护当前文章；先看状态，别把整个历史、浏览器文档和正文重复加载进上下文。
 
 ```powershell
-$publisherCli = './skills/manying-wechat-publisher/scripts/publisherctl.py'
-$articleRoot = './.runtime/manying-articles'
+$publisherCli = 'C:/Users/Admin/Desktop/codex/xxmanmi-video-downloader/skills/manying-wechat-publisher/scripts/publisherctl.py'
+$articleRoot = 'C:/Users/Admin/Desktop/codex/xxmanmi-video-downloader/.runtime/manying-articles'
 python $publisherCli status --root $articleRoot --limit 5
 python $publisherCli new --root $articleRoot --topic '作品名与本篇角度' --title '本篇标题'
 ```
@@ -42,9 +43,9 @@ python $publisherCli new --root $articleRoot --topic '作品名与本篇角度' 
 1. **选题与证据。** 先查最近稿件的主题、类型和风格，避开同题同角度重复，按[内容与数据合同](references/editorial.md)确定本篇的轮换方案。将类型、口吻、图文组织、互动方式及与近期稿件的差异简记在当前稿件的`research.md`，供下次复用。最新动态、日期、上映地区、平台、评分等查权威来源，区分消息发布日期与事件日期；将采用的来源和对应事实保存到`content.json`，后续复用，不反复搜索已核验事实。
 2. **正文与配图。** 写入结构化`content.json`。用多张确实相关、权属依据清楚的作品原有图片与短段落承载重点，按本篇类型安排顺序和节奏；图片数量、篇幅与版式按选题判断，不固定为一种图数或A–E选择模板。优先适用的官方宣传素材，不把公开可访问等同于授权。用户明确要求AI新图时才使用当时可用的imagegen技能，标明性质，不伪装正片截图。
 3. **程序准备。** `fetch-image`下载已核实的公开图片，`register-image`导入自有/授权本地图片，`render`生成本地预览HTML和粘贴HTML，`check`校验文件、字数、摘要、素材与来源。CLI不能替代事实、版权、图片内容和排版的人工/模型判断。
-4. **后台编辑。** 真正开始浏览器操作时才阅读 [后台发布与有界恢复](references/browser-publishing.md)，同时遵守当前安装的Browser/Chrome技能。复用已登录浏览器、有效绑定和既有草稿。先上传本地图片，再用实际微信图片DOM生成粘贴HTML，不反复尝试外链图片自动导入。
-5. **验收与保存。** 验证标题、正文、配图、动图实际动画、封面、摘要及创作来源、文字原创声明、正文网站介绍与「原文链接」；看到保存回执后记录`draft-saved`。原生图片、封面和最终预览核验用`verify`分别落盘，缺项不能进入发布准备状态。再运行每日存档脚本的`check`，结合题材角度和表达判断排除重复。
-6. **发布与确认。** 用户授权有效、`check --stage publish`通过后才提交。需要管理员扫码时记录`awaiting-admin`、保留当前验证页并明确请求用户扫码；结果不明记录`uncertain`，先查后台历史，不重复提交。只有后台已发表记录和实际公开文章URL都核实后才能记录`published`。
+4. **后台编辑。** 先读[本地RPA后台操作](references/rpa-publishing.md)。用`doctor`检查依赖，启动一个`rpa_session.py`持续进程，核对真实账号、发表记录和原草稿。已发表的只核验与补账，在途稿先查结果。对确认为空的编辑器执行`prepare`：逐张上传→按新图片DOM建立文件映射→重新render→正常HTML剪贴板粘贴。封面、文字原创、创作来源和原文链接也在同一本地RPA会话完成。横版与方形裁切均看截图，坐标只来自当前截图；异常按[本地RPA恢复](references/browser-publishing.md)处理。
+5. **验收与保存。** `save`比较现场历史版本/保存回执的前后变化，真实新增后才记`draft-saved`。从该保存稿卡片新打开阅读预览，`readcheck`核对正文顺序、图片身份和加载，并保存截图；它不自动把facts、cover等人工判断标成通过。核对标题、摘要、作者、图注、两种封面、文字原创、赞赏、适用来源、网站介绍和原文链接后，用`verify`记录真实依据。GIF/视频另查实际动画/播放。最后查重并复核题材与表达。
+6. **发布与确认。** 授权有效、发表门禁和查重通过后，沿用同一会话，按[正式发表RPA操作](references/rpa-publication.md)依次调用`publication-open`→观察→`publication-config`→观察→`publication-review`→核对→`submit`。默认即时公开发表，不额外群发通知；用户明确要求通知时遵从其范围。不把未知确认串成盲点计划。最终点击前写持久意图，提交后不重放。扫码、审核中和等候发表保留真实状态。后台已发表记录与对应公开页均核验后才`record-published`；脚本退出0不等于发表成功。
 7. **后续。** 正式公开页核验后，用`scripts/archive_articles.py archive`更新当日存档，保留全文、素材摘要、公开链接及类型、深度和节奏。输出标题、真实状态和必要的用户动作；不输出整套内部操作。用户再次要求继续时先查CLI状态和后台结果，再恢复断点。
 
 ## 常用命令
@@ -73,4 +74,5 @@ python $publisherCli record --dir $articleDir --event published --url '实际核
 - 草稿：后台实际保存，并验证正文配图、封面与必要声明；本地manifest记为`editor_saved`。
 - 待扫码：内容准备完成，但微信要求验证；不是发布成功，也不能称全自动已经跑通。
 - 发布：真实后台已发表记录和公开正文都已核实，公开URL入账，无重复文章。
+- 本地记录滞后：由真实已发表记录打开公开页，核对原稿后`record-published`补账，不伪造历史提交或验收事件；按公开页实际发表日期归档。
 - 安装本技能本身不启动发布、不消耗群发次数，也不解除尚未完成的扫码验证。

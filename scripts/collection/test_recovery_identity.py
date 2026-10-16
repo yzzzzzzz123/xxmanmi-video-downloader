@@ -53,6 +53,9 @@ class RecoveryIdentitySafety(unittest.TestCase):
             def call(inner, method, args):
                 if method == 'thread/read':
                     return {'thread': {'id': args['threadId'], 'cwd': str(outer.root)}}
+                if method == 'thread/turns/list':
+                    return {'data':[{'id':'direct-control','status':'inProgress','items':[
+                        {'id':'user-resume','type':'userMessage','content':[{'type':'text','text':'continue'}]}]}]}
                 if method == 'thread/goal/get':
                     return {'goal': inner.goal}
                 if method == 'thread/goal/set':
@@ -73,8 +76,9 @@ class RecoveryIdentitySafety(unittest.TestCase):
     def test_explicit_adoption_and_resume_preserve_original_slots_and_old_faults(self):
         recovery.adopt_main(caller_thread=OWNER, request_id='user-adopt', authorized=True)
         self.assertTrue(json.loads(self.state.read_text())['collection_paused'])
+        self.rpc_type.goal = {'status':'active'}
         result = recovery.resume_project(caller_thread=OWNER, request_id='user-resume', authorized=True)
-        self.assertIsNone(result['native_goal_status'])
+        self.assertEqual(result['native_goal_status'],'active')
         self.assertEqual(json.loads(self.main.read_text())['slots'], self.slots)
         ledger = json.loads(self.ledger.read_text())
         self.assertEqual(ledger['previous_cycles'][0]['state']['incidents']['01']['attempts'], 9)
@@ -89,6 +93,48 @@ class RecoveryIdentitySafety(unittest.TestCase):
         ledger = json.loads(self.ledger.read_text())
         self.assertTrue(ledger['stopped'])
         self.assertEqual(ledger['incidents']['01']['attempts'], 9)
+
+    def host_pause(self):
+        recovery.save_json(self.main, {'main_thread': OWNER, 'paused': True})
+        recovery.save_json(self.policy, {'main_thread': OWNER})
+        recovery.save_json(self.state, {'version': 1, 'collection_active_owner': OWNER,
+            'collection_paused': True, 'collection_pause_reason': 'Native server Goal is blocked',
+            'cover_outcomes': {'consecutive_program_ids': [17, 18]}})
+        recovery.save_json(self.ledger, {'version': 1, 'stopped': False,
+            'cycle_started_at': '2026-01-01T00:00:00Z',
+            'incidents': {'main': {'first_failed_at': '2026-01-01T00:00:00Z', 'attempts': 3}}})
+
+    def test_user_continuation_preserves_host_fault_cycle_and_cover_streak(self):
+        self.host_pause()
+        self.rpc_type.goal = {'status': 'active'}
+        with patch.object(recovery, 'check', return_value={'stop_required': False}):
+            result = recovery.resume_project(caller_thread=OWNER, request_id='user-resume', authorized=True)
+        self.assertFalse(result['cycle_reset'])
+        self.assertFalse(json.loads(self.state.read_text())['collection_paused'])
+        self.assertEqual(json.loads(self.state.read_text())['cover_outcomes']['consecutive_program_ids'], [17, 18])
+        ledger = json.loads(self.ledger.read_text())
+        self.assertEqual(ledger['incidents']['main']['attempts'], 3)
+        self.assertEqual(ledger['cycle_started_at'], '2026-01-01T00:00:00Z')
+
+    def test_host_continuation_rejects_missing_user_item_and_required_stop(self):
+        self.host_pause()
+        self.rpc_type.goal = {'status': 'active'}
+        with patch.object(recovery, 'check', return_value={'stop_required': True}):
+            with self.assertRaisesRegex(ValueError, 'formal stop'):
+                recovery.resume_project(caller_thread=OWNER, request_id='user-resume', authorized=True)
+        with patch.object(recovery, 'check', return_value={'stop_required': False}):
+            with self.assertRaisesRegex(ValueError, 'user message'):
+                recovery.resume_project(caller_thread=OWNER, request_id='invented-request', authorized=True)
+        self.assertTrue(json.loads(self.state.read_text())['collection_paused'])
+
+    def test_host_continuation_keeps_gate_closed_if_goal_remains_paused(self):
+        self.host_pause()
+        self.rpc_type.goal = {'status': 'paused'}
+        with patch.object(recovery, 'check', return_value={'stop_required': False}):
+            with self.assertRaisesRegex(ValueError, 'actually resume'):
+                recovery.resume_project(caller_thread=OWNER, request_id='user-resume', authorized=True)
+        self.assertTrue(json.loads(self.state.read_text())['collection_paused'])
+        self.assertEqual(json.loads(self.ledger.read_text())['incidents']['main']['attempts'], 3)
 
 
 if __name__ == '__main__':

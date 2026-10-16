@@ -37,6 +37,7 @@ def article_record(directory):
         'publication_id': manifest.get('publication_id', directory.name),
         'account': manifest.get('account'), 'title': manifest.get('title', ''),
         'topic': manifest.get('topic', ''), 'status': manifest.get('status'),
+        'published_at': manifest.get('published_at'),
         'published_at_observed': manifest.get('published_at_observed'),
         'public_url': manifest.get('public_url'), 'provenance': 'local_article',
         'article_directory': directory.name, 'content': content,

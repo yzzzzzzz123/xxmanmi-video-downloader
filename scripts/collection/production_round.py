@@ -328,7 +328,7 @@ def accept_receipt(ledger, receipt):
             or receipt.get('identity_manifest_sha256') != release['manifest_sha256']
             or receipt.get('package_manifest_sha256') != release.get('package_manifest_sha256')
             or receipt.get('resource_rows') != release.get('resource_rows')
-            or receipt.get('target') != 'ubuntu@example.invalid'
+            or receipt.get('target') != 'ubuntu@43.134.92.99'
             or receipt.get('database') != 'manying'):
         raise ValueError('Production receipt is incomplete or differs from the frozen package')
     checks = receipt.get('checks') or {}

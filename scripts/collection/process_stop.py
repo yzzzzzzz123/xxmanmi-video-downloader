@@ -8,6 +8,9 @@ import json
 import os
 import re
 import subprocess
+import shlex
+import signal
+import select
 from ctypes import wintypes
 from pathlib import Path
 
@@ -15,7 +18,7 @@ from pathlib import Path
 COLLECTION_COMMANDS = {
     'workflowctl.py', 'searchctl.py', 'coordctl.py', 'recover_search.py',
     'production_sync.py', 'production_live.py', 'catalogue_align.py',
-    'mainctl.py', 'operationsctl.py', 'recoveryctl.py',
+    'mainctl.py', 'operationsctl.py', 'recoveryctl.py', 'playwrightctl.py', 'single_agentctl.py',
 }
 UUID = re.compile(r'[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}', re.I)
 
@@ -28,6 +31,18 @@ def targets_for(config, main, coordination, recovery, project):
             or not main.get('paused')
             or not coordination.get('collection_paused')):
         raise ValueError('Forced termination requires authorization and closed gates')
+    if main.get('execution_mode') == 'single':
+        owner = config.get('main_thread')
+        binding = main.get('slots', {}).get('main', {})
+        registered = coordination.get('threads', {}).get(owner, {})
+        work = Path(binding.get('work', '')).resolve()
+        if (not owner or not UUID.fullmatch(owner) or main.get('main_thread') != owner
+                or set(main.get('slots', {})) != {'main'} or binding.get('owner') != owner
+                or coordination.get('collection_active_owner') != owner
+                or not registered.get('work') or Path(registered['work']).resolve() != work
+                or not work.is_relative_to(project.resolve())):
+            raise ValueError('Single agent stop bindings disagree')
+        return {owner: work}
     controls = {config.get('main_thread'), config.get('host_parent_thread')}
     if (None in controls or len(controls) != 2
             or main.get('main_thread') != config['main_thread']
@@ -75,7 +90,14 @@ def dedicated_owner(argv, executable, owners, project):
         return None
     name = Path(executable).name.lower()
     args = argv[1:]
-    if name == 'codex.exe':
+    if name in {'chrome.exe','chromium.exe','chrome','chromium','headless_shell'} and isinstance(owners,dict):
+        profile = next((a.split('=',1)[1] for a in args if a.startswith('--user-data-dir=')),None)
+        if profile and any(a=='--headless' or a.startswith('--headless=') for a in args):
+            for owner,work in owners.items():
+                if work is not None and Path(profile).resolve()==Path(work).resolve()/'playwright-browser-profile':
+                    return owner
+        return None
+    if name in {'codex.exe','codex'}:
         # An app-server may mention a UUID in its arguments; it is still shared.
         if not args or args[0] not in {'resume', 'exec'} or 'app-server' in args:
             return None
@@ -83,7 +105,7 @@ def dedicated_owner(argv, executable, owners, project):
             if arg == 'resume' and args[i + 1] in owners:
                 return args[i + 1]
         return None
-    if name not in {'python.exe', 'pythonw.exe'}:
+    if name not in {'python.exe', 'pythonw.exe'} and not (os.name!='nt' and re.fullmatch(r'python(?:\d+(?:\.\d+)?)?',name)):
         return None
     entry = next((Path(a) for a in args if a.lower().endswith('.py')), None)
     if (entry is None or not entry.is_absolute()
@@ -97,11 +119,25 @@ def dedicated_owner(argv, executable, owners, project):
 
 
 def process_snapshot():
-    command = ('Get-CimInstance Win32_Process | Select-Object ProcessId,'
+    if os.name!='nt':
+        rows=[]
+        for folder in Path('/proc').iterdir():
+            if not folder.name.isdigit():continue
+            try:
+                fields=(folder/'stat').read_text().split(') ',1)[1].split()
+                arguments=[part.decode('utf-8','replace') for part in (folder/'cmdline').read_bytes().split(b'\0') if part]
+                rows.append({'ProcessId':int(folder.name),'ParentProcessId':int(fields[1]),
+                    'CreationDate':fields[19],'ExecutablePath':str((folder/'exe').resolve(strict=True)),
+                    'CommandLine':shlex.join(arguments),'Arguments':arguments,
+                    'cwd':str((folder/'cwd').resolve(strict=True))})
+            except (OSError,ValueError,IndexError):continue
+        return rows
+    command = ('[Console]::OutputEncoding=[System.Text.UTF8Encoding]::new($false); '
+               'Get-CimInstance Win32_Process | Select-Object ProcessId,'
                'ParentProcessId,CreationDate,ExecutablePath,CommandLine | '
                'ConvertTo-Json -Compress')
     result = subprocess.run(['powershell', '-NoProfile', '-Command', command],
-        capture_output=True, text=True, timeout=15,
+        capture_output=True, text=True, encoding='utf-8', timeout=15,
         creationflags=subprocess.CREATE_NO_WINDOW, check=True)
     rows = json.loads(result.stdout or '[]')
     return rows if isinstance(rows, list) else [rows]
@@ -118,6 +154,23 @@ def protected_ancestors(rows, pid):
 
 def terminate_exact(row):
     """Pin a process handle, verify image and creation time, then confirm exit."""
+    if os.name!='nt':
+        try:handle=os.pidfd_open(row['ProcessId'])
+        except ProcessLookupError:return {'ok':True,'already_exited':True}
+        try:
+            folder=Path('/proc')/str(row['ProcessId'])
+            try:
+                start=(folder/'stat').read_text().split(') ',1)[1].split()[19]
+                executable=str((folder/'exe').resolve(strict=True))
+            except FileNotFoundError:return {'ok':True,'already_exited':True}
+            if start!=row.get('CreationDate') or executable!=row.get('ExecutablePath'):
+                raise ValueError('Process identity changed; refusing PID reuse')
+            signal.pidfd_send_signal(handle,signal.SIGTERM)
+            poll=select.poll();poll.register(handle,select.POLLIN)
+            if not poll.poll(3000):signal.pidfd_send_signal(handle,signal.SIGKILL)
+            exited=bool(poll.poll(3000))
+            return {'ok':exited,'exit_verified':exited,'creation_start_ticks':start}
+        finally:os.close(handle)
     kernel = ctypes.WinDLL('kernel32', use_last_error=True)
     kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
     kernel.OpenProcess.restype = wintypes.HANDLE
@@ -178,8 +231,6 @@ def stop_owned_processes(config, main, coordination, recovery, project, rpc, cal
     # Enumerate once, before terminal termination, so the stop driver survives to
     # save its receipt. The snapshot's image/time are rechecked on pinned handles.
     try:
-        if os.name != 'nt':
-            raise RuntimeError('This process stopper requires Windows')
         rows = process_snapshot()
         protected = protected_ancestors(rows, os.getpid())
     except Exception as error:
@@ -196,7 +247,7 @@ def stop_owned_processes(config, main, coordination, recovery, project, rpc, cal
                 source = thread.get('source') or {}
                 spawned = source.get('subAgent', {}).get('thread_spawn', {}) if isinstance(source, dict) else {}
                 parent = thread.get('parentThreadId') or spawned.get('parent_thread_id')
-                if parent != main['host_parent_thread']:
+                if main.get('execution_mode')!='single' and parent != main['host_parent_thread']:
                     raise ValueError('Native collector parent mismatch')
             status = thread.get('status') or {}
             if isinstance(status, dict) and status.get('type') == 'notLoaded':
@@ -234,7 +285,10 @@ def stop_owned_processes(config, main, coordination, recovery, project, rpc, cal
         for row in rows:
             if not row.get('ExecutablePath') or not row.get('CommandLine'):
                 continue
-            owner = dedicated_owner(windows_argv(row['CommandLine']),
+            arguments=windows_argv(row['CommandLine']) if os.name=='nt' else list(row.get('Arguments',[]))
+            if os.name!='nt':
+                arguments=[str((Path(row['cwd'])/part).resolve()) if part.endswith('.py') and not Path(part).is_absolute() else part for part in arguments]
+            owner = dedicated_owner(arguments,
                                     row['ExecutablePath'], owners, project)
             if not owner:
                 continue
@@ -250,6 +304,6 @@ def stop_owned_processes(config, main, coordination, recovery, project, rpc, cal
     except Exception as error:
         process_receipts.append({'ok': False, 'error_type': type(error).__name__})
     return {'ok': all(r['ok'] for r in [*terminal_receipts.values(), *process_receipts]),
-        'method': 'native_owned_terminals_and_verified_dedicated_windows_processes',
+        'method': 'native_owned_terminals_and_verified_dedicated_'+('windows' if os.name=='nt' else 'linux')+'_processes',
         'thread_terminals': terminal_receipts, 'dedicated_processes': process_receipts,
         'shared_processes_terminated': False}

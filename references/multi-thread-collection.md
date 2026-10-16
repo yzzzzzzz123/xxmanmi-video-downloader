@@ -1,3 +1,5 @@
+> Historical reference only. Current execution uses single_agentctl.py and Playwright; do not resume collector subagents or CUA. See low-token-workflow.md.
+
 # 多 agent 共享采集
 
 采集日常入口见 [低 Token 工作流](low-token-workflow.md)：`claim-detail` 恢复/领批并生成任务书，`complete-detail --logs-stopped` 核验收批。主线程日常只读 [主线程短流程](main-supervision.md)。本文仅用于首次编组、交接、恢复和分步异常；正常每批不加载全部历史规则。
@@ -62,7 +64,7 @@ register --state STATE --thread THREAD --work ABSOLUTE_WORK
 claim --state STATE --thread THREAD --limit 4
 ```
 
-登记幂等；目录不能暗中更换。旧`--coordinator`/`--role`调用只为兼容本地历史状态，主线程职责以当前Skill为准。新增采集线程必须用自身真实身份登记并使用独占工作目录，不绕过注册。每个peer按自己的有界任务书领取批次；队列不足时先核对真实pending和cover_pending，再沿已观察的公开列表、来源和真实分页补充详情URL。不能绕过队列采集、猜链接、创建关键词或榜单发现任务，空队列不代表全站完成。在途批次拒绝重复claim；健康线程用current续未完成页，死亡换新先正式交接。ready后完成本地同步、核验、封面门禁和ack，才领下一批。
+登记幂等；目录不能暗中更换。旧`--coordinator`/`--role`调用只为兼容本地历史状态，主线程职责以当前Skill为准。新增采集线程必须用自身真实身份登记并使用独占工作目录，不绕过注册。每个peer按自己的有界任务书领取批次；队列不足时先核对真实pending和cover_pending，再沿已观察的公开列表、来源和真实分页补充详情URL。不能绕过队列采集、猜链接、创建关键词或榜单发现任务，空队列不代表全站完成。在途批次拒绝重复claim；健康线程用current续未完成页，死亡换新先正式交接。正常完整收批须完成本地同步、核验、封面门禁和真实ack后再领下一批；单节目无封面按下述待补规则处理，只有正式入口确认可接续且未触发全局停工时才继续。
 
 每个注册 peer 都可补队列：从项目根用 `python -B Datebase/xxmanmi-resource-db/dbctl.py pending --limit <小批数量> --source 小小漫迷 --unvisited-only` 获取真实已发现详情，排除 `coordination-request.md` 中未迁移且仍被保留的范围，再提交项目真实条目数组：
 
@@ -150,7 +152,7 @@ reactivate-retired-idle --state STATE --thread ORIGINAL_UUID --work ORIGINAL_WOR
 ready --state STATE --thread THREAD --batch BATCH --results RESULTS.json --logs-stopped
 ```
 
-ready 后保持目录静止，不能立刻领下一批或继续补日志；由本线程自行按下一节入库、核验、同步封面并 ack。其他 peer 协助收尾前先与 owner 约定单一处理者，避免同时对同一目录执行 finish。等待锁或协助结果时使用产品等待机制，不高频轮询。任一其他线程不在线不妨碍本线程正常入库和协调；不能因此篡改他人 owner 或丢弃日志。
+ready 后保持目录静止，不能未经正式收尾就领下一批或继续补日志；由本线程自行按下一节入库、核验、同步封面，正常完整收批须真实 ack，无封面项须按待补规则保留并取得正式可接续结果。其他 peer 协助收尾前先与 owner 约定单一处理者，避免同时对同一目录执行 finish。等待锁或协助结果时使用产品等待机制，不高频轮询。任一其他线程不在线不妨碍本线程正常入库和协调；不能因此篡改他人 owner 或丢弃日志。
 
 若本批每个 claimed URL 都已在本线程 `details.ndjson` 尾部形成完整 `captured` 观察，并已明确停止日志，优先执行：
 
@@ -158,7 +160,7 @@ ready 后保持目录静止，不能立刻领下一批或继续补日志；由�
 python -B scripts/collection/workflowctl.py complete-captured --state STATE --thread THREAD --batch BATCH --logs-stopped
 ```
 
-此兼容命令只处理全 captured 批次，并受与新批相同的封面门禁。新批默认用 `workflowctl.py complete-detail --thread THREAD --batch BATCH --logs-stopped`：按任务书固定日志边界验证 captured/raw，自动生成 results、ready、带数据库写锁的 finish/finish-raw、逐页 audit，再为 captured 节目同步完成封面门禁和批次回执，最后才 verification 与 ack；未观察页用重复 `--failed URL 原因` / `--skipped URL 原因` 明确声明。raw/failed/skipped 不要求封面，仍待复核且不计完整节目。已 ready 的批次重入复用原真实结果；半行、URL/归属冲突、核验或封面失败拒绝 ack。仅程序明确拒绝的异常才使用下述分步协议，不手拼可由程序生成的证据。
+此兼容命令只处理全 captured 批次，并受与新批相同的封面门禁。新批默认用 `workflowctl.py complete-detail --thread THREAD --batch BATCH --logs-stopped`：按任务书固定日志边界验证 captured/raw，自动生成 results、ready、带数据库写锁的 finish/finish-raw、逐页 audit，再为 captured 节目同步完成封面门禁和批次回执，正常完整收批最后才 verification 与 ack；未观察页用重复 `--failed URL 原因` / `--skipped URL 原因` 明确声明。raw/failed/skipped 不要求封面，仍待复核且不计完整节目；不得将已采节目改成这些结果来跳过封面。已 ready 的批次重入复用原真实结果；半行、URL/归属冲突或核验失败拒绝 ack。当前 CLI 在封面失败时也拒绝 ack，待补跳过须按下述规则适配正式入口，不把现有参数当成已支持的新机制。仅程序明确拒绝的异常才使用下述分步协议，不手拼可由程序生成的证据。
 
 ## 各线程自行入库、核验与去重
 
@@ -168,9 +170,13 @@ python -B scripts/collection/workflowctl.py complete-captured --state STATE --th
 
 数据库写入采用**各 peer 原子取锁、轮流写入**：新版 `dbctl` 写入口与 `batchctl finish` 共享数据库目录下 `.runtime/database-writer.lock`。`finish` 在首个状态检查前取锁，持有至同步、规划、逐页审计和最终结果证据生成结束；内部短数据库事务再做锁内检查点复核。锁默认最多等 30 秒，失败明确退出，异常只释放仍属于自身 token 的锁，不删除未知陈旧锁。其他线程可继续采集自己独占的页面，只在需要写库时排队。启用新版前确认旧版写入进程结束；长期导入模块的进程需重新加载，不能假定旧实例自动获得保护。独立 `coordctl ack` 不写 PostgreSQL，在 finish 释放写锁后据实际证据调用，不宣称跨两个 CLI 一直持有数据库锁。
 
-数据库同步和逐页审计成功后、ack 前，收批程序必须把本批每个 captured 节目交给独立中央封面 worker；worker 在全局封面锁内用全库指纹/标题状态核验已有封面或安装新封面，并把逐项结果原子写入绑定 batch/work 的回执。封面只取该节目已核验资源，经本地 relay 有界解码真实帧；不得浏览器播放取链、猜 URL，或用重复图、坏图、文字卡补位。异步 enqueue、文件存在和非中央 writer 的输出都不证明完成。任一 captured 项未通过时批次保持 `ready/cover_pending`，不得 ack 或 claim 下一批；raw/failed/skipped 不进入门禁。重入须复用回执和幂等结果，不能重复抓帧或绕过锁。
+数据库同步和逐页审计成功后、ack 前，收批程序必须把本批每个 captured 节目交给独立中央封面 worker；worker 在全局封面锁内用全库指纹/标题状态核验已有封面或安装新封面，并把逐项结果原子写入绑定 batch/work 的回执。封面只取该节目已核验资源，经本地 relay 有界解码真实帧；不得浏览器播放取链、猜 URL，或用重复图、坏图、文字卡补位。异步 enqueue、文件存在和非中央 writer 的输出都不证明完成。正常完整收批须所有 captured 项通过封面门禁；raw/failed/skipped 不进入门禁。重入须复用回执和幂等结果，不能重复抓帧或绕过锁。
 
-核验无误后，本线程或已约定的协助 peer 准备与该批次和原工作目录绑定的核验文件，并 ack：
+按[封面恢复规则](cover-recovery.md#单节目无封面与连续失败停工)，确认实际 `DIRECT` 且有界候选、窗口与质量/去重门禁耗尽后，单节目仍无合格封面可保留待补并跳过，继续其他节目；保留资源、原批次、证据和真实 `cover_pending` / `unavailable`，不删除节目或假造完整成功。四路合并按中央封面实际处理完成顺序统计不同节目的连续无封面结果，第 1–6 个可跳过，第 7 个立即全局关闭写闸并强制停工；只有真实合格封面成功清零，同节目重试、raw、换批、换 owner 或重启均不得冒充新节目或重置计数。系统、鉴权、数据库和工具结果未知的故障仍走原恢复流程。
+
+待补跳过须由正式收批入口逐项记录并确认可接续，不能手改 ACK、verification 或状态，不能借通用 `release`、`--skipped` 或删除节目入口代替。当前 CLI 尚未实现该跳过和全局计数机制，适配前保留原批次，不编造参数，不因规范更新恢复已暂停采集。
+
+正常完整收批且封面核验全部通过后，本线程或已约定的协助 peer 准备与该批次和原工作目录绑定的核验文件，并 ack；以下成功声明不适用于无封面待补项：
 
 ```json
 {"batch_id":"BATCH","verified":true,"verifier":"逐页核验、必要 raw 对账及封面门禁","work":"本批原绝对工作目录","sync_ok":true,"audit_ok":true,"cover_ok":true,"cover_receipt":"绑定本 batch/work 的回执路径","evidence":{"method":"实际使用的核验方法","checked_items":4,"summary":"本批每个 URL 的资源与封面核验结果"}}
@@ -184,7 +190,7 @@ ack --state STATE --thread THREAD --batch BATCH --verification VERIFY.json
 
 确认故障已解除且允许再次尝试后，任一注册 peer 可用 `retry --state STATE --thread THREAD --items RETRY_ITEMS.json --reason 真实修复依据`，输入为 1–8 个 `{url}` 对象。只允许已有 `manual_review` 项；未知、重复、queued/claimed/ready/acknowledged 任一项使整批拒绝。成功仅将指定项各放回队列一次，保留旧批次/结果/核验证据并记录重试次数与原因；不会自动重试编号页、权限失败或仍在运行的页。随后正常 claim；不能用重复 enqueue 绕过待补审核。
 
-任何peer补充共享详情队列后，各已ack的agent按下一份有界任务书claim小批，无须用户逐批分工。新增URL只能来自已观察的公开列表、来源、真实下一页或数据库真实pending；不经关键词供给、分类或系列归组。coordctl只调度详情URL，不把搜索任务伪装成详情页，不据空队列认定全站穷尽。
+任何peer补充共享详情队列后，各已真实ack或经正式待补入口确认可接续的agent，在未触发全局停工时按下一份有界任务书claim小批，无须用户逐批分工。新增URL只能来自已观察的公开列表、来源、真实下一页或数据库真实pending；不经关键词供给、分类或系列归组。coordctl只调度详情URL，不把搜索任务伪装成详情页，不据空队列认定全站穷尽。
 
 ## 正式记录与最小监督
 
@@ -192,6 +198,6 @@ ack --state STATE --thread THREAD --batch BATCH --verification VERIFY.json
 
 规范不包含分类Skill、核验步骤、标签补齐、系列归组或新分类字段写入要求。既有节目、资源、分类、系列及关联、任务、claim、证据和回执保持原样，不归档、迁移或删表；规范修改不改网站或分类程序代码、不变更登记、不联系或恢复暂停线程、不发布生产。
 
-仅异常时展开精确owner的current、任务书和回执，不循环读取健康线程或全库status。首次真实故障时间持久保留，超过一小时仍未恢复按正式停止流程关闭写闸、中断本项目采集并核验实际终态；共享服务和所有数据保留，不汇报、不自动恢复。
+仅异常时展开精确owner的current、任务书和回执，不循环读取健康线程或全库status。首次真实故障时间持久保留，超过两小时仍未恢复按正式停止流程关闭写闸、中断本项目采集并核验实际终态；共享服务和所有数据保留，不汇报、不自动恢复。
 
 同一详情页只算一个节目，不同详情URL分别保留；journaled、ready和ack不能代替数据库真实完成数。并发finish的全库差量不能直接作为某线程新增或相加，使用绑定URL的核验证据与同一来源过滤的真实快照。不猜数量、不把queued/pending当生产成功、不宣称未经验证的无人值守能力。

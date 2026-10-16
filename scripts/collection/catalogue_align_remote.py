@@ -111,7 +111,7 @@ def apply(path,bundle_hash,manifest_hash):
     ids=clean_ids(manifest.get('program_ids')) if delta else None
     require(delta or 'program_ids' not in manifest,'Unexpected delta scope')
     require(re.fullmatch(r'catalogue-\d{8}-\d{6}-[0-9a-f]{12}',rid),'Unsafe release identifier')
-    require(manifest['policy']=='all_catalogue_records' and manifest['target']=='ubuntu@example.invalid' and manifest['database']=='manying','Scope or target differs')
+    require(manifest['policy']=='all_catalogue_records' and manifest['target']=='ubuntu@43.134.92.99' and manifest['database']=='manying','Scope or target differs')
     require(set(manifest['tables'])==set(TABLES),'Unexpected catalogue tables')
     require(set(files)=={'manifest.json',*manifest['files']},'Unexpected payload files')
     require(all(sha(files[name])==digest for name,digest in manifest['files'].items()),'Payload checksum differs')

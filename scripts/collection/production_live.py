@@ -13,6 +13,7 @@ from pathlib import Path
 import psycopg
 import catalogue_align as alignment
 import coordctl
+import collection_runtime
 from production_sync import (PROJECT, RUNTIME, STATE, WorkerLock, db_options,
                              hidden_options, save_json, utc_now)
 
@@ -23,12 +24,15 @@ CURRENT = RUNTIME / 'catalogue-live-current.json'
 
 
 def allowed():
+    if not collection_runtime.production() and collection_runtime.LOCAL_RETIRED.exists():
+        return False
     if not POLICY.is_file():
         return False
     policy = json.loads(POLICY.read_text('utf-8'))
     main = json.loads(MAIN.read_text('utf-8'))
     return (policy.get('enabled') is True and policy.get('sync', {}).get('enabled') is True
-            and policy['sync'].get('mode') == 'event_delta' and not main.get('paused'))
+            and policy['sync'].get('mode') == 'event_delta' and not main.get('paused')
+            and not coordctl._read_state(STATE).get('collection_paused'))
 
 
 def ledger():
@@ -47,6 +51,8 @@ def mutate(operation):
 
 
 def enqueue(program_ids, *, owner=None, batch=None):
+    if collection_runtime.production():
+        return {'ok':True,'queued':0,'pending':0,'mode':'production-direct'}
     ids = alignment.clean_ids(list(program_ids)) if program_ids else []
     def add(state):
         for value in ids:
@@ -63,13 +69,20 @@ def lookup_ids(urls):
     options = db_options()
     options['options'] = '-c default_transaction_read_only=on -c statement_timeout=15000'
     with psycopg.connect(**options) as connection, connection.cursor() as cursor:
-        cursor.execute('SELECT id FROM programs WHERE source_url=ANY(%s) ORDER BY id',
+        cursor.execute("""SELECT p.id FROM programs p
+            WHERE p.source_url=ANY(%s) AND p.captured_at IS NOT NULL
+              AND EXISTS (SELECT 1 FROM resources r WHERE r.program_id=p.id
+                          AND r.media_type IN ('m3u8','MP4')
+                          AND r.original_url ~* '^https://[^[:space:]]+$')
+            ORDER BY p.id""",
                        (list(set(urls)),))
         return [row[0] for row in cursor.fetchall()]
 
 
 def mark_dirty(owner, *, batch=None, receipt=None):
     """Persist intent BEFORE local DB writes, so a killed post-commit hook is recoverable."""
+    if collection_runtime.production():
+        return
     if not allowed():
         return
     key = 'batch:' + batch if batch else 'search:' + str(Path(receipt).resolve())
@@ -84,6 +97,8 @@ def mark_dirty(owner, *, batch=None, receipt=None):
 
 
 def clear_dirty(key, token=None):
+    if collection_runtime.production():
+        return
     def clear(current):
         item = current.get('dirty', {}).get(key)
         if item and (token is None or item['token'] == token):
@@ -92,13 +107,22 @@ def clear_dirty(key, token=None):
 
 
 def notify_batch(owner, batch_id, state_path=STATE):
+    if collection_runtime.production():
+        import server_production
+        current = server_production.read(server_production.CURRENT,{})
+        return {'ok':True,'mode':'production-direct','queued':0,
+            'production_verified':current.get('batch')==batch_id and current.get('phase')=='verified'}
     if not allowed():
         return {'ok': True, 'enabled': False}
     state = coordctl._read_state(Path(state_path))
     batch = state.get('batches', {}).get(batch_id)
     if not batch or batch.get('thread') != owner:
         raise ValueError('Live event must belong to the real batch owner')
-    result = enqueue(lookup_ids(batch['item_urls']), owner=owner, batch=batch_id)
+    accepted = [row['url'] for row in batch.get('results', [])
+                if row.get('outcome') == 'captured'
+                and row['url'] not in batch.get('verification', {}).get('cover_pending_items', [])]
+    result = enqueue(lookup_ids(accepted) if batch.get('state') == 'acknowledged' else [],
+                     owner=owner, batch=batch_id)
     if batch.get('state') == 'acknowledged':
         clear_dirty('batch:' + batch_id)
     result['executor'] = kick()
@@ -119,6 +143,8 @@ def notify_search(owner, receipt_path):
 
 
 def reconcile_dirty():
+    if collection_runtime.production():
+        return {'recovered':0,'mode':'production-direct'}
     if not allowed():
         return {'recovered': 0}
     intents = dict(ledger().get('dirty', {}))
@@ -174,8 +200,16 @@ def process_identity(pid):
 
 
 def kick():
+    if collection_runtime.production():
+        return {'started':False,'reason':'production_direct_no_ssh_executor'}
     if not allowed():
         return {'started': False, 'reason': 'disabled_or_stopped'}
+    # Collector sandboxes can enqueue committed data but cannot use the host's
+    # SSH transport. The existing business-main pulse starts that executor.
+    caller = os.environ.get('CODEX_THREAD_ID')
+    main_thread = json.loads(MAIN.read_text('utf-8')).get('main_thread')
+    if caller and caller != main_thread:
+        return {'started': False, 'reason': 'queued_for_business_main'}
     def launch(state):
         worker = state.get('worker')
         if worker and worker.get('identity') and process_identity(worker['pid']) == worker['identity']:
@@ -221,15 +255,34 @@ def drain(token=None, max_passes=4):
                         break
                     revisions = {key: state['pending'][key]['revision'] for key in keys}
                     ids = sorted(map(int, keys))
-                prepared = alignment.prepare(ids, current_path=CURRENT, event_revisions=revisions)
-                if not allowed():
-                    break
-                if prepared['state'] != 'already_aligned':
-                    alignment.publish(current_path=CURRENT)
+                if (frozen and frozen.get('state') == 'verified'
+                        and not frozen.get('independent_verified_at')):
+                    # Publication may have succeeded before its independent read
+                    # failed. Finish that exact frozen receipt before preparing
+                    # another snapshot; an already_aligned response leaves the
+                    # old CURRENT untouched and would otherwise starve new events.
+                    # Another authorized deployment can switch the app after the
+                    # transaction receipt but before independent inspection. Use
+                    # the existing immutable-payload rebind; preserve the old
+                    # receipt and reapply/verify under the new app binding. Never
+                    # waive the application-unchanged or user-data checks.
+                    rebound = alignment.rebind_frozen_delta(frozen, CURRENT)
+                    if rebound:
+                        if not allowed():
+                            break
+                        alignment.publish(current_path=CURRENT)
                     verified = alignment.verify_frozen(CURRENT)
                     release_id = verified['release_id']
                 else:
-                    release_id = None
+                    prepared = alignment.prepare(ids, current_path=CURRENT, event_revisions=revisions)
+                    if not allowed():
+                        break
+                    if prepared['state'] != 'already_aligned':
+                        alignment.publish(current_path=CURRENT)
+                        verified = alignment.verify_frozen(CURRENT)
+                        release_id = verified['release_id']
+                    else:
+                        release_id = None
                 def accepted(current):
                     for key, version in revisions.items():
                         if current['pending'].get(key, {}).get('revision') == version:
@@ -287,6 +340,9 @@ def prime(since):
 
 
 def status():
+    if collection_runtime.production():
+        import server_production
+        return server_production.status()
     state = ledger()
     worker = state.get('worker')
     return {'ok': True, 'enabled': allowed(), 'pending': len(state['pending']),

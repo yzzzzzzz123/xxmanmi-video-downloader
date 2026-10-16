@@ -54,6 +54,16 @@ class ArchiveTests(unittest.TestCase):
         self.assertFalse(result['ok'])
         self.assertIn('same_body', result['duplicates'][0]['reasons'])
 
+    def test_late_reconciliation_uses_actual_publication_day(self):
+        folder = self.article('reconciled', '昨晚已发表', '实际发表日期与今天核验日期不同。',
+                              stamp='2026-10-14T01:00:00+00:00')
+        manifest = ctl.read_json(folder / 'manifest.json')
+        manifest['published_at'] = '2026-10-13T23:13:00+08:00'
+        ctl.write_json(folder / 'manifest.json', manifest)
+        self.assertEqual(archive.archive_day(self.root, '2026-10-13')['articles'], 1)
+        self.assertEqual(archive.archive_day(self.root, '2026-10-14')['articles'], 0)
+        self.assertEqual(ctl.read_json(folder / 'manifest.json'), manifest)
+
     def test_normalized_title_and_long_copied_paragraph_are_detected(self):
         copied = '这一段足够长的主体文字在两篇不同文章中被完整复用，会造成内容重复，必须在发文前发现并改写而不是只换一个标题。'
         self.article('old', '看房单！', copied)

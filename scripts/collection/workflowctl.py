@@ -119,6 +119,8 @@ def read_state(state_path: Path) -> dict[str, Any]:
 def owner_record(state_path: Path, owner: str) -> tuple[dict[str, Any], Path]:
     state = read_state(state_path)
     coordctl.require_collection_running(state)
+    if state.get('execution_mode')=='single' and owner!=state.get('collection_active_owner'):
+        raise ValueError('Historical collection owner cannot run work in single agent mode')
     record = state.get("threads", {}).get(owner)
     if not record:
         raise ValueError(f"owner is not a registered peer: {owner}")
@@ -3534,6 +3536,21 @@ def _ensure_batch_covers(work: Path, batch_id: str,
     pending = targets
     selected: dict[str, dict[str, Any]] = {}
     failures: dict[str, dict[str, Any]] = {}
+    cover_pending: dict[str, dict[str, Any]] = {}
+    if receipt_path.is_file():
+        previous = json.loads(receipt_path.read_text(encoding="utf-8"))
+        previous_items = previous.get("items", []) if previous.get("batch_id") == batch_id else []
+        for target in targets:
+            match = next((item for item in previous_items
+                          if item.get("collection_cover", {}).get("cover_pending") is True
+                          and all(item.get(key) == value for key, value in target.items())), None)
+            if match is not None:
+                if str(COVERCTL.parent) not in sys.path:
+                    sys.path.insert(0, str(COVERCTL.parent))
+                import collection_cover_policy
+                collection_cover_policy.verify_pending(match, read_state(DEFAULT_STATE))
+                cover_pending[target["source_url"]] = match
+        pending = [target for target in targets if target["source_url"] not in cover_pending]
     atomic_json(request_path, [{key: target[key] for key in
                                 ("source_url", "program_id", "title")}
                                for target in pending])
@@ -3545,12 +3562,12 @@ def _ensure_batch_covers(work: Path, batch_id: str,
         process = subprocess.run(
             command, capture_output=True, text=True, encoding="utf-8",
             timeout=900, **_hidden_subprocess_options(),
-        )
+        ) if pending else None
     except (OSError, subprocess.TimeoutExpired) as exc:
         process = None
         failure_message = f"coverctl unavailable: {type(exc).__name__}"
     else:
-        failure_message = f"coverctl exited with code {process.returncode}"
+        failure_message = f"coverctl exited with code {process.returncode}" if process else "retained pending covers"
     payload = None
     if process is not None and process.stdout:
         try:
@@ -3586,24 +3603,56 @@ def _ensure_batch_covers(work: Path, batch_id: str,
         message = ((response.get("reason") or response.get("error"))
                    if isinstance(response, dict) else None) or failure_message
         failures[target["source_url"]] = _cover_failure(target, status, message)
+        if isinstance(response, dict) and response.get("collection_cover", {}).get("cover_pending") is True:
+            from importlib import import_module
+            if str(COVERCTL.parent) not in sys.path:
+                sys.path.insert(0, str(COVERCTL.parent))
+            policy = import_module("collection_cover_policy")
+            item = {**target, **failures[target["source_url"]],
+                    "collection_cover": response["collection_cover"]}
+            policy.verify_pending(item, read_state(DEFAULT_STATE))
+            cover_pending[target["source_url"]] = item
 
     ordered = [selected.get(target["source_url"])
+               or cover_pending.get(target["source_url"])
                or failures.get(target["source_url"])
                or _cover_failure(target) for target in targets]
     command_ok = (process is not None and process.returncode == 0
                   and isinstance(payload, dict) and payload.get("ok") is True)
     complete = len(selected) == len(targets) and command_ok
+    settled = (complete or (not pending and len(cover_pending) == len(targets))
+               or (process is not None and process.returncode in (0, 3)
+               and isinstance(payload, dict) and len(selected) + len(cover_pending) == len(targets)))
     receipt = {"version": 1, "batch_id": batch_id, "complete": complete,
                "cover_checked_items": len(selected), "items": ordered}
-    if not complete:
+    if cover_pending:
+        receipt.update(settled=settled, cover_pending_items=list(cover_pending))
+    if not settled:
         # Keep a previously bound receipt intact while recording failed revalidation.
         failure_path = (work / f"{batch_id}-cover-revalidation.json"
                         if (work / f"{batch_id}-verification.json").exists() else receipt_path)
         atomic_json(failure_path, receipt)
+        import recoveryctl
+        recoveryctl.guard(caller_thread=os.environ.get("CODEX_THREAD_ID"))
         raise RuntimeError(
             f"cover gate selected {len(selected)}/{len(targets)} programs; "
             f"batch remains ready; receipt={receipt_path}"
         )
+    if cover_pending:
+        bound_path = work / f"{batch_id}-verification.json"
+        if bound_path.exists():
+            bound = json.loads(bound_path.read_text(encoding="utf-8"))
+            if (json.loads(receipt_path.read_text(encoding="utf-8")) != receipt
+                    or hashlib.sha256(receipt_path.read_bytes()).hexdigest() != bound.get("cover_receipt_sha256")
+                    or bound.get("cover_pending_items") != list(cover_pending)):
+                raise ValueError("previously bound cover evidence cannot change during pending settlement")
+        atomic_json(receipt_path, receipt)
+        import recoveryctl
+        recoveryctl.guard(caller_thread=os.environ.get("CODEX_THREAD_ID"))
+        return {"cover_ok": False, "cover_settled": True,
+                "cover_checked_items": len(selected), "cover_pending_items": list(cover_pending),
+                "cover_receipt": str(receipt_path.resolve()),
+                "cover_receipt_sha256": hashlib.sha256(receipt_path.read_bytes()).hexdigest()}
     receipt_hash = _preserve_bound_cover_receipt(work, batch_id, receipt_path, receipt)
     if receipt_hash is None:
         atomic_json(receipt_path, receipt)
@@ -3650,7 +3699,8 @@ def complete_captured(state_path: Path, owner: str, batch_id: str,
         if (finished.get("ok") is not True or finished.get("error_count") != 0
                 or audit.get("records") != len(expected)
                 or audit.get("passed") != len(expected)):
-            raise RuntimeError("batchctl finish did not verify every captured batch item")
+            raise RuntimeError("batchctl finish did not verify every captured batch item: "
+                               + json.dumps(finished.get("errors", []), ensure_ascii=False))
         cover_verification = _ensure_batch_covers(work, batch_id, expected)
         if _journal_versions(work) != journal_versions:
             raise RuntimeError("journal evidence changed during cover finalization")
@@ -3734,7 +3784,8 @@ def _detail_book(state_path: Path, owner: str, batch_id: str, work: Path,
         "objective": "采集本批已观察详情页并逐页入库核验；raw/失败保留待复核。",
         "scope": {"observed_urls": batch["item_urls"]}, "limit": len(batch["item_urls"]),
         "inputs": [str(state_path.resolve())], "coordination_state": str(state_path.resolve()),
-        "acceptance": ["单标签单 lane", "先打开开发者工具并右侧停靠",
+        "capture_engine": "playwright",
+        "acceptance": ["独立无界面 Playwright、单页面单 lane，采集线程只读取脚本结果",
                        "实际检查 #list a[data-web] 属性及完整计数，不以 AX 无 href 判无资源",
                        "验证码期限/更新验证码提示不作为采集前置条件或失败依据",
                        "完整公开 DOM 观察", "停写后逐页 finish/audit/ack"],
@@ -3781,6 +3832,23 @@ def _detail_observations(work: Path, batch: dict[str, Any],
             url = coordctl._page_url(record.get("url"))
             if url not in expected:
                 raise ValueError("journal evidence after this batch boundary contains an unclaimed URL")
+            if book.get('capture_engine')=='playwright':
+                import playwrightctl
+                evidence_path=Path(record.get('playwrightEvidence',''))
+                if (not evidence_path.is_absolute() or evidence_path.is_symlink()
+                        or not evidence_path.resolve().is_relative_to(work.resolve())
+                        or not evidence_path.is_file() or evidence_path.stat().st_nlink!=1):
+                    raise ValueError('Missing or unsafe Playwright source receipt')
+                raw_evidence=evidence_path.read_bytes()
+                evidence=json.loads(raw_evidence)
+                original_item=read_state(Path(book['coordination_state']))['items'][url]['item']
+                playwrightctl.validate_evidence(evidence,original_item,book['owner'],book['batch_id'])
+                if record.get('playwrightJobId')!=evidence.get('jobId'):
+                    raise ValueError('Playwright journal job identity differs from source receipt')
+                evidence['evidencePath']=str(evidence_path)
+                preview=playwrightctl.node('preview',evidence=evidence,item=original_item,work=str(work))
+                if preview.get('observation')!=record or evidence_path.read_bytes()!=raw_evidence:
+                    raise ValueError('Playwright source receipt does not reproduce the journal')
             if outcome == "captured":
                 document = dbctl.normalize("details", record)
                 if not document["programs"][0]["captured"] or not document["resources"]:
@@ -3805,10 +3873,178 @@ def _detail_observations(work: Path, batch: dict[str, Any],
     return found
 
 
+def _repair_ascii_detail_fields(state_path, owner, batch_id, work, proof, source_tool,
+                                data, evidence_path, taskbooks):
+    """Restore only proven ASCII replacement loss in an entirely unstarted batch."""
+    from xml.etree import ElementTree
+    from urllib.parse import urljoin, urlsplit
+    from app_server_control import RPC
+    import recoveryctl
+
+    slot, binding = recoveryctl.slot_for(owner)
+    if (state_path.resolve() != DEFAULT_STATE.resolve() or taskbooks.resolve() != DEFAULT_TASKBOOKS.resolve()
+            or binding.get('registration_verified') is not True or Path(binding['work']).resolve() != work
+            or proof.get('formal_current') != {'capture_executed': False, 'prepare_executed': False}):
+        raise ValueError('ASCII recovery requires the original registered, unstarted batch')
+    state_tool = proof.get('source_state_tool')
+    with RPC() as rpc:
+        thread = rpc.call('thread/read', {'threadId': owner, 'includeTurns': False})['thread']
+        if (thread.get('parentThreadId') != binding['host_parent']
+                or thread.get('status', {}).get('type') != 'idle'
+                or Path(thread.get('cwd', '')).resolve() not in {PROJECT_ROOT.resolve(), PROJECT_ROOT.parent.resolve()}):
+            raise ValueError('Original DOM owner must be idle with its registered parent/cwd')
+        native = rpc.call('thread/turns/list', {'threadId': owner, 'limit': 3,
+            'sortDirection': 'desc', 'itemsView': 'full'}).get('data', [])
+    receipts = {}
+    for tool_id in {source_tool, state_tool}:
+        calls = [item for turn in native for item in turn.get('items', []) if item.get('id') == tool_id]
+        if len(calls) != 1:
+            raise ValueError('ASCII recovery requires the exact bounded original DOM calls')
+        call = calls[0]
+        code = (call.get('arguments') or {}).get('code', '')
+        result = call.get('result') or {}
+        contents = result.get('content', [])
+        surface = (result.get('_meta') or {}).get('codex/toolSurface') or {}
+        if (call.get('type') != 'mcpToolCall' or call.get('status') != 'completed'
+                or call.get('readOnlyHint') is not True or call.get('server') != 'cua_repl'
+                or call.get('tool') != 'js' or '.playwright.' not in code or '.evaluate(' not in code
+                or re.search(r'\.(?:goto|click|fill|press|reload|close|fetch|runDetailBatchSegment)\s*\(', code)
+                or surface.get('backend') != 'chrome' or surface.get('browserFamily') != 'chrome'
+                or not surface.get('browserId') or len(contents) != 1 or contents[0].get('type') != 'text'):
+            raise ValueError('ASCII recovery requires completed read-only Chrome DOM receipts')
+        receipts[tool_id] = (call, json.loads(contents[0]['text']))
+    card_call, original = receipts[source_tool]
+    state_call, state_result = receipts[state_tool]
+    positions = [(turn['id'], index, item) for turn in native
+                 for index, item in enumerate(turn.get('items', []))]
+    card_pos = next((turn, index) for turn, index, item in positions if item.get('id') == source_tool)
+    state_pos = next((turn, index) for turn, index, item in positions if item.get('id') == state_tool)
+    if (card_pos[0] != state_pos[0] or state_pos[1] > card_pos[1]
+            or any(item.get('type') == 'mcpToolCall' and item.get('readOnlyHint') is not True
+                   for turn, index, item in positions
+                   if turn == card_pos[0] and state_pos[1] < index < card_pos[1])):
+        raise ValueError('Source/card receipts must belong to one unchanged public DOM observation')
+    if original != proof.get('source_result') or state_result != proof.get('source_state_result'):
+        raise ValueError('Saved ASCII evidence differs from the original native DOM results')
+    card_meta = card_call['result']['_meta']
+    state_meta = state_call['result']['_meta']
+    page_url = card_meta.get('browser_use', {}).get('url', '')
+    if (page_url != state_meta.get('browser_use', {}).get('url')
+            or card_meta['codex/toolSurface']['browserId'] != state_meta['codex/toolSurface']['browserId']
+            or urlsplit(page_url).scheme != 'https' or urlsplit(page_url).hostname not in {'xxmanmi.com', 'www.xxmanmi.com'}):
+        raise ValueError('Original source/card browser and public page differ')
+    latest_source = proof.get('source_view') == 'public_latest'
+    if latest_source:
+        # A latest-list claim has no query. Prove that view from visible DOM;
+        # an old value in the hidden search input must never become its query.
+        old = proof.get('original_item', {})
+        url = coordctl._page_url(old.get('url', ''))
+        view = state_result.get('view', {})
+        card = state_result.get('targetCard', {})
+        sources = [row for row in state_result.get('checkedSourceAndTypes', [])
+                   if row.get('name') == 'newNum']
+        ancestors = original.get('ancestry', [])
+        active_tabs = [row for row in view.get('tabNodes', [])
+                       if 'weui-bar__item_on' in row.get('className', '').split()]
+        visible_containers = {row.get('id') for row in ancestors
+                              if row.get('tag') == 'DIV' and row.get('visible') is True}
+        if (old.get('query') != '' or state_result.get('url') != page_url
+                or view.get('loading') != []
+                or view.get('searchInput', {}).get('visible') is not False
+                or len(active_tabs) != 1
+                or 'data-id="like"' not in active_tabs[0].get('outerHTML', '')
+                or original.get('activeQueryView') is not False
+                or original.get('loadingTextVisible') is not False
+                or original.get('targetVisible') is not True
+                or original.get('targetHref') != url or card.get('href') != url
+                or len(original.get('selectedMainView', [])) != 1
+                or original['selectedMainView'][0].get('dataId') != 'like'
+                or not {'newList', 'like'}.issubset(visible_containers)
+                or not ancestors or ancestors[0].get('tag') != 'A'
+                or ancestors[0].get('visible') is not True
+                or len(sources) != 1 or sources[0].get('labelVisible') is not True
+                or not isinstance(sources[0].get('value'), str)
+                or not sources[0]['value'].isdigit()
+                or sources[0].get('id') != 'newNum' + sources[0]['value']
+                or 'input[type="radio"]:checked' not in state_call['arguments']['code']):
+            raise ValueError('Empty-query ASCII recovery requires the settled visible latest source/card DOM')
+        original = {'href': card['href'], 'html': card.get('innerHTML')}
+        source_state = {'selected': [sources[0].get('label')], 'loading': 0, 'query': '',
+                        'items': [{'href': card['href']}]}
+    else:
+        source_state = state_result.get('state', {})
+    selected = source_state.get('selected', [])
+    if len(selected) != 1 or source_state.get('loading') not in (0, []):
+        raise ValueError('Original public source selection is not settled and unambiguous')
+    old = proof.get('original_item', {})
+    url = coordctl._page_url(old.get('url', ''))
+    visible = source_state.get('results', source_state.get('items', []))
+    if len([item for item in visible
+            if urljoin(page_url, item.get('href', item.get('url', ''))) == url]) != 1:
+        raise ValueError('Original selected source must contain exactly the claimed public URL')
+    if 'href' in original:
+        card = original
+        tree = ElementTree.fromstring(card['html'])
+    else:
+        cards = [item for item in source_state.get('items', []) if urljoin(page_url, item.get('href', '')) == url]
+        if len(cards) != 1:
+            raise ValueError('Original source DOM must identify exactly one claimed result')
+        card = cards[0]
+        tree = ElementTree.fromstring('<div>' + card['html'] + '</div>')
+    badges = list(tree)
+    title = (tree.text or '').strip()
+    if (urljoin(page_url, card.get('href', '')) != url or tree.tag != 'div' or not title
+            or len(badges) != 1 or badges[0].tag != 'p' or list(badges[0])
+            or 'weui-media-box__desc' not in badges[0].get('class', '').split()
+            or (badges[0].tail or '').strip()):
+        raise ValueError('Original DOM card does not contain separate title and status nodes')
+    fields = {'title': title, 'status': (badges[0].text or '').strip(),
+              'source': selected[0], 'query': source_state.get('query')}
+    if (not all(isinstance(fields[key], str) and 0 < len(fields[key]) <= 1000
+                for key in ('title', 'status', 'source'))
+            or not isinstance(fields['query'], str) or len(fields['query']) > 1000
+            or (not fields['query'] and not latest_source)
+            or old.get('title') == title
+            or any(old.get(key) != value.encode('ascii', 'replace').decode('ascii') for key, value in fields.items())):
+        raise ValueError('Queue fields are not exactly the proven ASCII replacement loss')
+    digest = hashlib.sha256(data).hexdigest()
+    with work_lock(work):
+        def operation(state):
+            if (recoveryctl.slot_for(owner) != (slot, binding) or evidence_path.read_bytes() != data
+                    or os.environ.get('CODEX_THREAD_ID') != recoveryctl.policy().get('main_thread')):
+                raise ValueError('ASCII recovery authority/evidence changed during verification')
+            peer = coordctl._require_peer(state, owner)
+            batch = state['batches'].get(batch_id, {})
+            if (batch.get('thread') != owner or batch.get('state') != 'claimed'
+                    or peer.get('active_batch') != batch_id or url not in batch.get('item_urls', [])
+                    or Path(batch.get('work', '')).resolve() != work):
+                raise ValueError('ASCII recovery requires the same active claimed batch')
+            _path, book = _detail_book(state_path, owner, batch_id, work, batch, taskbooks)
+            versions = _journal_versions(work)
+            if _detail_observations(work, batch, book) or any(work.glob(f'{batch_id}-native-detail-*.json')):
+                raise ValueError('ASCII recovery cannot change a prepared or journalled batch')
+            record = state['items'][url]
+            history = record.setdefault('title_correction_history', [])
+            if any(row.get('evidence_sha256') == digest for row in history):
+                return {'ok': True, 'status': 'already_repaired', 'batch': batch_id, 'url': url}, False
+            if record.get('state') != 'claimed' or record.get('batch') != batch_id or record['item'] != old:
+                raise ValueError('Original damaged queue item changed')
+            if versions != _journal_versions(work):
+                raise ValueError('Owner journals changed during ASCII recovery')
+            history.append({'corrected_at': utc_now(), 'batch': batch_id, 'previous_item': old,
+                'correction_kind': 'ascii_replacement_loss', 'evidence': str(evidence_path),
+                'evidence_sha256': digest, 'source_tool': source_tool, 'source_state_tool': state_tool})
+            record['item'] = {**old, **fields}
+            return {'ok': True, 'command': 'repair-detail-title', 'status': 'repaired',
+                    'batch': batch_id, 'url': url, 'claim_and_evidence_preserved': True,
+                    'next_action': 'original owner claim-detail to refresh remaining input'}, True
+        return coordctl._update(state_path, operation)
+
+
 def repair_detail_title(state_path: Path, owner: str, batch_id: str,
                         evidence_path: Path, source_tool: str, logs_stopped: bool, *,
                         taskbooks: Path = DEFAULT_TASKBOOKS) -> dict[str, Any]:
-    """Repair a proven HD badge or ampersand escape layer; retain the same claim."""
+    """Repair proven public title/source text damage; retain the same claim."""
     from xml.etree import ElementTree
     from urllib.parse import urljoin
     from app_server_control import RPC
@@ -3831,6 +4067,9 @@ def repair_detail_title(state_path: Path, owner: str, batch_id: str,
             or proof.get('owner') != owner or proof.get('batch') != batch_id
             or Path(proof.get('work', '')).resolve() != work):
         raise ValueError('Title evidence does not match the uncaptured original claim')
+    if proof.get('correction_kind') == 'ascii_replacement_loss':
+        return _repair_ascii_detail_fields(state_path, owner, batch_id, work, proof, source_tool,
+                                          data, evidence_path, taskbooks)
     if entity_layers:
         if (formal.get('capture_attempted') is not True
                 or type(formal.get('capture_journaled')) is not int or formal['capture_journaled'] != 0):
@@ -4055,7 +4294,9 @@ def claim_detail_task(state_path: Path, owner: str, limit: int = 4, *,
         if batch_id is None:
             return {"ok": True, "command": "claim-detail", "status": "empty", "batch": None,
                     "remaining": 0, "items": [], "next_action": {"kind": "find_work",
-                    "reason": "check observed pending details or claim a real search; not goal completion"}}
+                    "reason": "Playwright observes allocated public sources; not goal completion",
+                    "argv": [sys.executable, "-B", str(HERE / "playwrightctl.py"),
+                             "discover", "--thread", owner]}}
         state = read_state(state_path)
         batch = state["batches"][batch_id]
         if batch["thread"] != owner or state["threads"][owner]["active_batch"] != batch_id:
@@ -4080,17 +4321,27 @@ def claim_detail_task(state_path: Path, owner: str, limit: int = 4, *,
                                       "--thread", owner, "--batch", batch_id,
                                       "--taskbooks", str(taskbooks.resolve()), "--logs-stopped"]}
                             if complete else {"kind": "capture", "input": str(capture_input),
-                                              "single_lane": True}),
+                                              "engine": "playwright", "single_lane": True,
+                                              "argv": [sys.executable, "-B", str(HERE / "playwrightctl.py"),
+                                                       "collect", "--thread", owner, "--batch", batch_id]}),
         }
 
 
 def complete_detail(state_path: Path, owner: str, batch_id: str, logs_stopped: bool, *,
                     taskbooks: Path = DEFAULT_TASKBOOKS,
                     failed: list[list[str]] | None = None,
-                    skipped: list[list[str]] | None = None) -> dict[str, Any]:
+                    skipped: list[list[str]] | None = None,
+                    source_owner: str | None = None) -> dict[str, Any]:
     if logs_stopped is not True:
         raise ValueError("complete-detail requires --logs-stopped")
-    _record, work = owner_record(state_path, owner)
+    actor = owner
+    if source_owner is not None and source_owner != owner:
+        from single_agentctl import authorized_handoff
+        owner = authorized_handoff(actor, source_owner, batch_id)
+        _record = read_state(state_path)['threads'][owner]
+        work = Path(_record['work']).resolve()
+    else:
+        _record, work = owner_record(state_path, owner)
     with work_lock(work):
         state = read_state(state_path)
         batch = state.get("batches", {}).get(batch_id)
@@ -4168,10 +4419,11 @@ def complete_detail(state_path: Path, owner: str, batch_id: str, logs_stopped: b
                 audit = finished.get("audit", {})
                 if (finished.get("ok") is not True or finished.get("error_count") != 0
                         or audit.get(total_key) != count or audit.get(passed_key) != count):
-                    raise RuntimeError(f"{mode} did not verify every {outcome} batch URL")
+                    raise RuntimeError(f"{mode} did not verify every {outcome} batch URL: "
+                                       + json.dumps(finished.get("errors", []), ensure_ascii=False))
                 audits[outcome] = audit
-            if not counts["captured"] and not counts["raw"]:
-                dbctl.sync(work, include_status=False)
+            # Unusable pages only settle their claim. Never import journals or
+            # create programme rows merely to acknowledge a skipped page.
             if _journal_versions(work) != journal_versions:
                 raise RuntimeError("journal evidence changed during finalization")
         captured_urls = [row["url"] for row in ordered if row["outcome"] == "captured"]
@@ -4198,7 +4450,11 @@ def complete_detail(state_path: Path, owner: str, batch_id: str, logs_stopped: b
         if verification_path.exists() and json.loads(verification_path.read_text(encoding="utf-8")) != verification:
             raise ValueError("existing verification conflicts with current batch evidence")
         atomic_json(verification_path, verification)
-        ack = coordctl.acknowledge_batch(state_path, owner, batch_id, verification)
+        ack = coordctl.acknowledge_batch(state_path, actor, batch_id, verification)
+        if cover_verification.get("cover_pending_items"):
+            pending_count = len(cover_verification["cover_pending_items"])
+            counts["captured"] -= pending_count
+            counts["cover_pending"] = pending_count
         return {"ok": True, "command": "complete-detail", "status": "acknowledged", "batch": batch_id,
                 "outcomes": dict(counts), "audit": audits, "manual_review": ack["manual_review"],
                 "results": str(results_path), "verification": str(verification_path),

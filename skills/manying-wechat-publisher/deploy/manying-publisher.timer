@@ -1,0 +1,12 @@
+[Unit]
+Description=Manying WeChat three articles at noon and 18:30 Beijing time
+
+[Timer]
+OnCalendar=*-*-* 12:00:00 Asia/Shanghai
+OnCalendar=*-*-* 18:30:00 Asia/Shanghai
+Persistent=false
+AccuracySec=1s
+Unit=manying-publisher.service
+
+[Install]
+WantedBy=timers.target

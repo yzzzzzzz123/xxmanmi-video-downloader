@@ -1,0 +1,13 @@
+{
+  "enabled": false,
+  "timezone": "Asia/Shanghai",
+  "times": ["12:00", "18:30"],
+  "count": 3,
+  "notify": false,
+  "account": "漫映Manying",
+  "home": "/var/lib/manying-publisher",
+  "workspace": "/opt/manying-publisher/current/workspace",
+  "articles": "/var/lib/manying-publisher/articles",
+  "codex": "/opt/manying-publisher/bin/codex",
+  "timeout_seconds": 6600
+}

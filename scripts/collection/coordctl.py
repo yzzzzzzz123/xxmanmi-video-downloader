@@ -211,6 +211,8 @@ def _require_thread(state: dict[str, Any], thread: str) -> dict[str, Any]:
 def _require_peer(state: dict[str, Any], thread: str) -> dict[str, Any]:
     """Authorize a registered trusted peer; persisted legacy roles grant no privileges."""
     require_collection_running(state)
+    if state.get('execution_mode') == 'single' and thread != state.get('collection_active_owner'):
+        raise CoordinationError('single agent mode: historical collectors cannot write')
     return _require_thread(state, thread)
 
 
@@ -300,6 +302,8 @@ def register_thread(
         if thread in state.get("retired_threads", {}):
             raise CoordinationError("thread was replaced; its old registration cannot be resumed")
         require_collection_running(state)
+        if state.get('execution_mode')=='single' and thread!=state.get('collection_active_owner'):
+            raise CoordinationError('single agent mode does not register collection subagents')
         existing = state["threads"].get(thread)
         if existing:
             if existing["work_key"] == work_key:
@@ -845,6 +849,7 @@ def enqueue_items(
     thread: str,
     items: list[dict[str, Any]],
     *,
+    refresh_evidence: str | Path | None = None,
     lock_timeout: float = DEFAULT_LOCK_TIMEOUT,
 ) -> dict[str, Any]:
     if not isinstance(items, list):
@@ -861,11 +866,41 @@ def enqueue_items(
         cleaned.append((key, item))
 
     def operation(state: dict[str, Any]) -> tuple[dict[str, Any], bool]:
-        _require_peer(state, thread)
+        peer = _require_peer(state, thread)
+        refresh = None
+        if refresh_evidence is not None:
+            proof_path = Path(refresh_evidence).resolve()
+            if (state.get('execution_mode') != 'single' or proof_path.is_symlink()
+                    or not proof_path.is_relative_to(Path(peer['work']).resolve())):
+                raise CoordinationError('Refresh requires the single agent public DOM receipt')
+            proof_data = proof_path.read_bytes()
+            refresh = json.loads(proof_data)
+            snapshot = refresh.get('snapshot', {})
+            if (refresh.get('status') != 'observed' or snapshot.get('view') != 'latest'
+                    or snapshot.get('loading') or not snapshot.get('panelVisible')
+                    or snapshot.get('readyState') != 'complete'
+                    or [_clean_item(v) for v in snapshot.get('items', [])] != cleaned):
+                raise CoordinationError('Refresh items do not match the settled latest DOM')
         added = 0
+        refreshed = 0
         existing = duplicate_input
         for key, item in cleaned:
             if key in state["items"]:
+                record = state['items'][key]
+                old = record['item']
+                if (refresh is not None and record['state']=='acknowledged'
+                        and not record.get('user_deleted') and item['title']==old['title']
+                        and item.get('status') and item['status']!=old.get('status')
+                        and key not in state['queue']):
+                    record.setdefault('update_history', []).append({
+                        'at':utc_now(),'previous_item':old,'previous_batch':record.get('batch'),
+                        'previous_outcome':record.get('outcome'),'evidence':str(proof_path),
+                        'evidence_sha256':hashlib.sha256(proof_data).hexdigest()})
+                    record.update(item=item,state='queued',batch=None,outcome=None)
+                    state['queue'].append(key)
+                    added += 1
+                    refreshed += 1
+                    continue
                 existing += 1
                 continue
             state["items"][key] = {
@@ -879,7 +914,7 @@ def enqueue_items(
             added += 1
         return {
             "ok": True, "command": "enqueue", "added": added,
-            "duplicates": existing, "queued": len(state["queue"]),
+            "duplicates": existing, "refreshed": refreshed, "queued": len(state["queue"]),
         }, added > 0
 
     return _update(state_path, operation, lock_timeout)
@@ -973,7 +1008,7 @@ def claim_batch(
 
     def operation(state: dict[str, Any]) -> tuple[dict[str, Any], bool]:
         require_collection_running(state)
-        record = _require_thread(state, thread)
+        record = _require_peer(state, thread)
         if record["active_batch"] is not None or record["mode"] != "idle":
             raise CoordinationError("thread must be acknowledged or explicitly released before another claim")
         selected = (state["queue"][:limit] if allowed_urls is None else
@@ -1051,7 +1086,7 @@ def ready_batch(
     cleaned = _clean_results(results)
 
     def operation(state: dict[str, Any]) -> tuple[dict[str, Any], bool]:
-        record = _require_thread(state, thread)
+        record = _require_peer(state, thread)
         batch = state["batches"].get(batch_id)
         if not batch or batch["thread"] != thread or record["active_batch"] != batch_id:
             raise CoordinationError("batch is not the active batch owned by this thread")
@@ -1089,6 +1124,7 @@ def _clean_verification(
     expected_work: str,
     expected_items: int,
     expected_captured_urls: list[str],
+    coordination: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     expected_captured = len(expected_captured_urls)
     if not isinstance(value, dict):
@@ -1118,10 +1154,16 @@ def _clean_verification(
     if type(evidence.get("checked_items")) is not int or evidence["checked_items"] != expected_items:
         raise CoordinationError("verification evidence checked_items must match the target batch")
     if expected_captured:
-        if value.get("cover_ok") is not True:
+        pending = value.get("cover_pending_items", [])
+        if (not isinstance(pending, list) or any(url not in expected_captured_urls for url in pending)
+                or len(set(pending)) != len(pending)):
+            raise CoordinationError("invalid cover pending item identities")
+        if pending and (value.get("cover_ok") is not False or value.get("cover_settled") is not True):
+            raise CoordinationError("pending covers require an explicit incomplete settlement")
+        if not pending and value.get("cover_ok") is not True:
             raise CoordinationError("captured results require cover_ok=true")
         if (type(value.get("cover_checked_items")) is not int
-                or value["cover_checked_items"] != expected_captured):
+                or value["cover_checked_items"] != expected_captured - len(pending)):
             raise CoordinationError(
                 "cover_checked_items must match the captured result count"
             )
@@ -1157,9 +1199,11 @@ def _clean_verification(
                 or type(receipt_document.get("version")) is not int
                 or receipt_document["version"] != 1
                 or receipt_document.get("batch_id") != batch_id
-                or receipt_document.get("complete") is not True
+                or receipt_document.get("complete") is not (not bool(pending))
+                or (pending and (receipt_document.get("settled") is not True
+                                 or receipt_document.get("cover_pending_items") != pending))
                 or type(receipt_document.get("cover_checked_items")) is not int
-                or receipt_document["cover_checked_items"] != expected_captured
+                or receipt_document["cover_checked_items"] != expected_captured - len(pending)
                 or not isinstance(receipt_document.get("items"), list)
                 or len(receipt_document["items"]) != expected_captured):
             raise CoordinationError("cover_receipt summary does not match the captured batch")
@@ -1183,6 +1227,17 @@ def _clean_verification(
                 raise CoordinationError(
                     "cover_receipt program_id values must be unique positive integers"
                 )
+            if source_url in pending:
+                if item.get("status") != "unavailable" or coordination is None:
+                    raise CoordinationError("pending cover requires a central unavailable result")
+                web = str(Path(__file__).resolve().parents[2] / "web")
+                if web not in sys.path:
+                    sys.path.insert(0, web)
+                from collection_cover_policy import verify_pending
+                verify_pending(item, coordination)
+                receipt_urls.add(source_url)
+                program_ids.add(program_id)
+                continue
             if (item.get("status") != "selected"
                     or item.get("selection") not in {"existing", "generated"}):
                 raise CoordinationError("cover_receipt requires selected cover items")
@@ -1217,14 +1272,22 @@ def acknowledge_batch(
             verification, batch_id, batch["work"], len(batch["item_urls"]),
             [result["url"] for result in batch["results"]
              if result["outcome"] == "captured"],
+            coordination=state,
         )
         owner = state["threads"][batch["thread"]]
         if owner["active_batch"] != batch_id:
             raise CoordinationError("batch owner state is inconsistent")
         manual = 0
         acknowledged = 0
+        pending = set(checked.get("cover_pending_items", []))
+        if pending:
+            batch.setdefault("resource_results", json.loads(json.dumps(batch["results"])))
         for result in batch["results"]:
             item_record = state["items"][result["url"]]
+            if result["url"] in pending:
+                result["outcome"] = "cover_pending"
+                result["note"] = "Resources audited; central DIRECT cover attempts exhausted; cover remains unavailable"
+                item_record["cover_status"] = "pending"
             if result["outcome"] == "captured":
                 item_record["state"] = "acknowledged"
                 acknowledged += 1
@@ -1235,6 +1298,7 @@ def acknowledge_batch(
         batch.update({
             "state": "acknowledged", "acknowledged_at": now,
             "verification": checked, "acknowledged_by": thread,
+            "complete_captured": not pending,
         })
         owner.update({"mode": "idle", "active_batch": None})
         return {

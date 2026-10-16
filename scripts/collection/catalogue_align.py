@@ -192,6 +192,10 @@ def rebind_frozen_delta(frozen, current_path):
 
 
 def prepare(program_ids=None, *, current_path=None, event_revisions=None):
+    import collection_runtime
+    collection_runtime.require_write()
+    if collection_runtime.production():
+        raise RuntimeError('Server collection promotes accepted staged batches; SSH catalogue sync is disabled')
     current_path = Path(current_path or CURRENT)
     program_ids = clean_ids(program_ids)
     if current_path.exists():
@@ -242,6 +246,10 @@ def prepare(program_ids=None, *, current_path=None, event_revisions=None):
 
 
 def publish(*, current_path=None):
+    import collection_runtime
+    collection_runtime.require_write()
+    if collection_runtime.production():
+        raise RuntimeError('Server collection promotes accepted staged batches; SSH catalogue sync is disabled')
     current_path = Path(current_path or CURRENT)
     frozen = json.loads(current_path.read_text('utf-8'))
     if frozen['state'] == 'verified':

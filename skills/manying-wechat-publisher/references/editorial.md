@@ -30,7 +30,7 @@
 使用`scripts/archive_articles.py`，本地操作，不接入微信凭据：
 
 ```powershell
-$archiveCli = './skills/manying-wechat-publisher/scripts/archive_articles.py'
+$archiveCli = 'C:/Users/Admin/Desktop/codex/xxmanmi-video-downloader/skills/manying-wechat-publisher/scripts/archive_articles.py'
 python -X utf8 $archiveCli archive --root $articleRoot --date 'YYYY-MM-DD'
 python -X utf8 $archiveCli check --root $articleRoot --dir $articleDir
 ```

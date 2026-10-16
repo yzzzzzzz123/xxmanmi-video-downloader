@@ -14,17 +14,18 @@ import zipfile
 
 PROJECT = Path(__file__).resolve().parents[1]
 NAME = "xxmanmi-video-downloader"
-ROOT_FILES = (".gitignore", "AGENTS.md", "README.md", "LICENSE", "requirements.txt")
-SOURCE_DIRS = ("scripts", "references", "skills")
+ROOT_FILES = (".gitignore", "AGENTS.md", "README.md")
+SOURCE_DIRS = ("scripts", "references", "skills", "Datebase", "web", "docs")
 EXCLUDED_DIRS = {".git", ".runtime", ".secrets", ".venv", "venv", "__pycache__",
                  "node_modules", "claims", "downloads", "observations", "dist", "build"}
 EXCLUDED_SUFFIXES = {".pyc", ".pyo", ".log", ".dump", ".bak", ".key", ".pem",
                      ".pfx", ".p12", ".zip", ".gz", ".tar", ".7z", ".sqlite",
                      ".db", ".mp4", ".mkv", ".ts", ".m3u8", ".ndjson", ".jsonl"}
 EXCLUDED_FILES = {"config.local.json", "manifest.json", "postgres_password.txt"}
-REQUIRED = ("README.md", "AGENTS.md", "LICENSE", "requirements.txt",
-            "skills/xxmanmi-video-downloader/SKILL.md",
-            "scripts/download.py", "scripts/collection/shared_discovery.py")
+REQUIRED = ("README.md", "AGENTS.md", "web/package.json", "web/package-lock.json",
+            "skills/xxmanmi-video-downloader/SKILL.md", "web/server.py",
+            "web/requirements.txt", "web/static/index.html",
+            "Datebase/xxmanmi-resource-db/schema.sql", "scripts/collection/shared_discovery.py")
 
 
 def source_files():

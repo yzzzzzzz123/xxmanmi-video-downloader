@@ -136,7 +136,7 @@ class RoundGateTests(unittest.TestCase):
                 'bundle_sha256': 'b' * 64,
                 'identity_manifest_sha256': release['manifest_sha256'],
                 'package_manifest_sha256': 'c' * 64, 'resource_rows': len(release['programmes']),
-                'target': 'ubuntu@example.invalid', 'database': 'manying',
+                'target': 'ubuntu@43.134.92.99', 'database': 'manying',
                 'verified_at': '2026-09-30T10:00:00Z',
                 'database_backup': '/opt/manying/backups/example/manying.dump',
                 'application_backup': '/opt/manying/backups/example/app.tar.gz',

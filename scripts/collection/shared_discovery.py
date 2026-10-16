@@ -1014,7 +1014,7 @@ def claim_search(
                 if abandoned is not None:
                     return {
                         "ok": False, "reason": abandoned["reason"],
-                        "path": str(path), "claim_sha256": claim_hash,
+                        "path": str(path), "claim_sha256": claim_hash,      
                         "claim": {**existing, "status": abandoned["reason"],
                                   "abandonment_id": abandoned["abandonment_id"]},
                     }
@@ -1076,7 +1076,7 @@ def inspect_claim(
                 "original_owner": original["owner"],
                 "original_task_id": original["task_id"],
                 "claim": {**current, "status": abandoned["reason"],
-                          "abandonment_id": abandoned["abandonment_id"]},
+                          "abandonment_id": abandoned["abandonment_id"]},       
                 "abandonment": abandoned,
             }
         return {

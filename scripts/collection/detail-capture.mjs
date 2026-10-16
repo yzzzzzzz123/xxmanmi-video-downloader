@@ -4,7 +4,7 @@ import {runCaptureBatch} from './capture-batch.mjs';
 import {appendObservation, writeIssue} from './capture-journal.mjs';
 import {captureDetailWithRecovery} from './capture-with-recovery.mjs';
 
-const DEFAULT_SELECTORS = Object.freeze({
+export const DEFAULT_SELECTORS = Object.freeze({
   title: '#video', episodes: '#list a[data-web]',
   groups: '[class*="playList"]', lines: 'label[for]',
 });

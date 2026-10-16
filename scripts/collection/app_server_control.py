@@ -22,7 +22,6 @@ def codex_binary():
    return str(candidates[0])
  return 'codex.exe' if os.name == 'nt' else 'codex'
 
-CODEX=codex_binary()
 CODEX_HOME_PATH=Path(os.environ.get('CODEX_HOME', str(Path.home() / '.codex'))).expanduser()
 SOCK=os.environ.get('XXMANMI_CODEX_SOCKET', str(CODEX_HOME_PATH / 'app-server-control/app-server-control.sock'))
 
@@ -36,7 +35,7 @@ def hidden_options():
 
 class Proxy:
  def __init__(self):
-  self.p=subprocess.Popen([CODEX,'app-server','proxy','--sock',SOCK],stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,**hidden_options())
+  self.p=subprocess.Popen([codex_binary(),'app-server','proxy','--sock',SOCK],stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,**hidden_options())
   self.q=queue.Queue();self.buf=b''
   def read():
    while True:
